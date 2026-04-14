@@ -15,6 +15,7 @@ from .obstacle import (
     resolve_obstacle_fleet_preset, build_obstacle_track_geometry, default_obstacle_layout,
     spawn_preset_obstacle_fleet, spawn_gt_obstacles, spawn_ws_obstacles,
 )
+from .obstacle_runtime import ObstacleRuntimeConfig, ObstacleRuntimeManager, ScenarioObstacleWrapper
 from .reward import DonkeyRewardWrapper, ImprovedRewardWrapperV3, V9DomainRewardWrapper
 from .control import (
     HighLevelControlWrapper,
@@ -36,9 +37,9 @@ from .callbacks import (
     ShortEpisodeLoggerCallback, CrashRecoveryCallback,
 )
 from .multi_scene_env import (
-    MultiSceneEnv, MultiSceneEnvV12, MultiSceneEnvV13,
+    MultiSceneEnv, MultiSceneEnvV12, MultiSceneEnvV13, MultiSceneEnvV16,
     MultiInputObsWrapper,
     _build_v12_wrapper_chain,
-    _build_state_v13,
+    _build_state_v13, _build_state_v16,
 )
 # All V8/V9 components unified here so v12 has no cross-file imports.

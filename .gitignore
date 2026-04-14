@@ -22,6 +22,8 @@ unitylog.txt
 *.log
 backups/
 evaluation_results/
+obv_smoke_*/
+obv_ws_channel_swap_*/
 
 # Donkey data / models
 data/

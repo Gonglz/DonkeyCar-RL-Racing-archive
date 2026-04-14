@@ -99,6 +99,8 @@ MONITOR_INFO_KEYS: Tuple[str, ...] = (
     "ep_r_near_collision",
     "ep_r_lap",
     "ep_r_lap_raw",
+    "ep_r_overtake",
+    "ep_overtake_count",
     "ep_soft_lap_count",
     "ep_r_smooth",
     "ep_r_jerk",

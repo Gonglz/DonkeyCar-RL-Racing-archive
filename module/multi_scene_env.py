@@ -87,6 +87,15 @@ def _set_handler_max_cte(base_env, max_cte: float, logging_key: str = ""):
         print(f"   [{logging_key}] ⚠️ set max_cte failed: {type(e).__name__}: {e}")
 
 
+def _clear_handler_over(base_env) -> None:
+    """清理底层 handler.over，避免 reset 后残留 done 状态污染下一回合。"""
+    try:
+        handler = base_env.viewer.handler
+        handler.over = False
+    except Exception:
+        pass
+
+
 # ============================================================
 # 多场景切换环境（V9 逻辑，仅依赖 module imports）
 # ============================================================
@@ -254,6 +263,10 @@ class MultiSceneEnv(gym.Env):
         self._scene_recent_hard_success = [deque(maxlen=self.dynamic_weight_window) for _ in env_ids]
         self._scene_best_mean_reward = [-np.inf for _ in env_ids]
         self.completed_episode_count = 0
+
+        # 方案B: 基于累积步数的动态权重（用于补偿短/长episode差异）
+        self._total_steps_per_scene = [0] * len(env_ids)  # 累积每个scene的总步数
+        self.use_step_based_weights = True  # 启用step-based权重调整
 
         self.active_env = None
         self.active_scene_idx = 0
@@ -472,6 +485,11 @@ class MultiSceneEnv(gym.Env):
 
     def _maybe_update_scene_weights(self):
         if not self.enable_dynamic_scene_weights:
+            # 即使禁用了基于成功率的动态权重，仍来应用基于步数的补偿
+            if self.use_step_based_weights and self.completed_episode_count > 0 and self.completed_episode_count % max(20, self.dynamic_weight_update_episodes) == 0:
+                new_w = np.array(self.scene_weights, dtype=np.float64)
+                new_w = self._apply_step_based_weight_compensation(new_w)
+                self.scene_weights = new_w.tolist()
             return
         if self.completed_episode_count <= 0 or self.completed_episode_count % self.dynamic_weight_update_episodes != 0:
             return
@@ -612,6 +630,11 @@ class MultiSceneEnv(gym.Env):
         self._last_dynamic_prev_weights = [float(x) for x in cur.tolist()]
         self._last_dynamic_target_weights = [float(x) for x in target.tolist()]
         self._last_dynamic_update_episode = int(self.completed_episode_count)
+
+        # 方案B: 基于累积步数进行额外补偿
+        if self.use_step_based_weights and len(self.env_ids) > 1:
+            new_w = self._apply_step_based_weight_compensation(new_w)
+
         self.scene_weights = new_w.tolist()
 
         parts = []
@@ -717,6 +740,35 @@ class MultiSceneEnv(gym.Env):
         except Exception:
             pass
         return float(np.clip(hard_success, 0.0, 1.0))
+
+    def _apply_step_based_weight_compensation(self, weights: np.ndarray) -> np.ndarray:
+        """
+        方案B: 基于累积步数的权重补偿
+
+        原理:
+          short_scene_total_steps = 1000 步   (20步/ep × 50 eps)
+          long_scene_total_steps = 3000 步    (600步/ep × 5 eps)
+
+          补偿因子 = sqrt(total_steps_max / total_steps_i)
+          short: sqrt(3000/1000) = 1.73 → 权重提升
+          long:  sqrt(3000/3000) = 1.00 → 权重不变
+        """
+        total_steps = np.array(self._total_steps_per_scene, dtype=np.float64)
+
+        # 只有当有足够数据时才应用补偿
+        if np.all(total_steps > 100):
+            max_steps = np.max(total_steps)
+            # 平方根衰减：避免过度补偿
+            compensation = np.sqrt(max_steps / np.maximum(total_steps, 1.0))
+            # 归一化补偿因子到 [0.8, 1.2] 范围
+            compensation = compensation / np.mean(compensation)
+            compensation = np.clip(compensation, 0.8, 1.2)
+            # 应用到权重
+            weights = weights * compensation
+            # 重新归一化权重
+            weights = weights / np.sum(weights)
+
+        return weights
 
     def _extract_episode_success_flag(self, info: Dict[str, Any], scene_idx: Optional[int] = None) -> float:
         """
@@ -917,7 +969,10 @@ class MultiSceneEnv(gym.Env):
                 f"当前场景[{cur_name}]已连续{self._cur_scene_episodes}集/{self._cur_scene_steps}步"
             )
 
-        return self.active_env.reset(**kwargs)
+        obs = self.active_env.reset(**kwargs)
+        if self._base_env is not None:
+            _clear_handler_over(self._base_env)
+        return obs
 
     def step(self, action):
         obs, reward, done, info = self.active_env.step(action)
@@ -929,7 +984,9 @@ class MultiSceneEnv(gym.Env):
                 if "r" in ep:
                     self._scene_recent_rewards[self.active_scene_idx].append(float(ep["r"]))
                 if "l" in ep:
-                    self._scene_recent_lengths[self.active_scene_idx].append(float(ep["l"]))
+                    ep_len = float(ep["l"])
+                    self._scene_recent_lengths[self.active_scene_idx].append(ep_len)
+                    self._total_steps_per_scene[self.active_scene_idx] += ep_len  # 累积步数
             # 成功率双轨记录：
             # - recent_success: 按 dynamic_success_mode（用于动态采样）
             # - hard_success: 原始 env_done/lap 规则（用于日志对照与误判排查）
@@ -1180,7 +1237,7 @@ class MultiInputObsWrapper(gym.Wrapper):
                 meta["state_prev_throttle"] = float(state[4])
         keep_scalar_keys = {"scene_key", "logging_key", "domain", "mask_coverage"}
         keep_tuple_keys = {"pos", "car", "gyro", "accel", "vel"}
-        keep_prefixes = ("ctrl/", "reward_debug/", "geo/", "smooth/")
+        keep_prefixes = ("ctrl/", "reward_debug/", "geo/", "smooth/", "obstacle_")
         for key, value in info.items():
             if key in keep_scalar_keys or key in keep_tuple_keys or any(key.startswith(prefix) for prefix in keep_prefixes):
                 meta[key] = self._json_safe(value)
@@ -1555,6 +1612,8 @@ def _build_v12_wrapper_chain(
     seg_model_path: Optional[str] = None,
     seg_feature_dim: int = 64,
     latent_align_weight: float = 0.0,
+    reset_env_done_grace_steps: int = 0,
+    reset_collision_grace_steps: int = 0,
 ):
     """
     构建 V12 wrapper 链并返回 (env, action_safety, high_level, reward_wrapper)。
@@ -1616,6 +1675,8 @@ def _build_v12_wrapper_chain(
         scene_key=scene_key,
         logging_key=logging_key,
         cte_half_width=float(cte_geometry.cte_half_width),
+        reset_env_done_grace_steps=reset_env_done_grace_steps,
+        reset_collision_grace_steps=reset_collision_grace_steps,
     )
     env = reward_wrapper
 
@@ -1721,6 +1782,9 @@ class MultiSceneEnvV12(MultiSceneEnv):
         near_offtrack_start_ratio: float = 0.70,
         w_near_collision: float = 0.35,
         near_collision_start_ratio: float = 0.65,
+        overtake_success_bonus: float = 2.5,
+        reset_env_done_grace_steps: int = 0,
+        reset_collision_grace_steps: int = 0,
         min_episodes_per_scene: int = 8,
         max_steps_per_scene: Optional[int] = 1024,
         enable_dynamic_scene_weights: bool = True,
@@ -1786,6 +1850,9 @@ class MultiSceneEnvV12(MultiSceneEnv):
         self.near_offtrack_start_ratio = float(near_offtrack_start_ratio)
         self.w_near_collision = float(w_near_collision)
         self.near_collision_start_ratio = float(near_collision_start_ratio)
+        self.overtake_success_bonus = float(max(0.0, overtake_success_bonus))
+        self.reset_env_done_grace_steps = max(0, int(reset_env_done_grace_steps))
+        self.reset_collision_grace_steps = max(0, int(reset_collision_grace_steps))
         scene_log_keys = [scene_specs[eid].get("logging_key", MultiSceneEnv._infer_scene_log_key(eid)) for eid in env_ids]
 
         super().__init__(
@@ -1911,6 +1978,7 @@ class MultiSceneEnvV12(MultiSceneEnv):
             near_offtrack_start_ratio=self.near_offtrack_start_ratio,
             w_near_collision=self.w_near_collision,
             near_collision_start_ratio=self.near_collision_start_ratio,
+            overtake_success_bonus=self.overtake_success_bonus,
             total_timesteps=self.total_timesteps,
             speed_vmax=self.speed_vmax,
             speed_kp=self.speed_kp, speed_ki=self.speed_ki, speed_kff=self.speed_kff,
@@ -1919,6 +1987,8 @@ class MultiSceneEnvV12(MultiSceneEnv):
             include_cte_in_obs=self.include_cte_in_obs,
             offtrack_leniency_ratio=self.offtrack_leniency_ratio,
             offtrack_leniency_mult=self.offtrack_leniency_mult,
+            reset_env_done_grace_steps=self.reset_env_done_grace_steps,
+            reset_collision_grace_steps=self.reset_collision_grace_steps,
         )
         self.action_safety_wrapper = action_safety
         self.reward_wrapper = reward_wrapper
@@ -1929,8 +1999,8 @@ class MultiSceneEnvV12(MultiSceneEnv):
         self.action_space = env.action_space
 
 
-# V13 状态构建函数实现在 obv.py，此处导入供本模块内部使用
-from .obv import _build_state_v13  # noqa: F401, E402
+# V13/V16 状态构建函数实现在 obv.py，此处导入供本模块内部使用
+from .obv import _build_state_v13, _build_state_v16  # noqa: F401, E402
 
 
 # ============================================================
@@ -2096,6 +2166,7 @@ class MultiSceneEnvV13(MultiSceneEnvV12):
             near_offtrack_start_ratio=self.near_offtrack_start_ratio,
             w_near_collision=self.w_near_collision,
             near_collision_start_ratio=self.near_collision_start_ratio,
+            overtake_success_bonus=self.overtake_success_bonus,
             cte_left=cte_left, cte_right=cte_right,
             cte_left_out=cte_left_out, cte_right_out=cte_right_out,
             coord_scale=coord_scale,
@@ -2105,11 +2176,14 @@ class MultiSceneEnvV13(MultiSceneEnvV12):
             scene_key=scene_key,
             logging_key=logging_key,
             cte_half_width=cte_half_width,
+            reset_env_done_grace_steps=self.reset_env_done_grace_steps,
+            reset_collision_grace_steps=self.reset_collision_grace_steps,
         )
         # Per-scene reward overrides（白名单合并）
         _ALLOWED_REWARD_OVERRIDES = {
             "near_offtrack_start_ratio", "w_near_offtrack",
             "w_near_collision", "near_collision_start_ratio",
+            "overtake_success_bonus",
             "w_center", "w_heading",
             "collision_penalty_base", "offtrack_penalty_base",
             "survival_reward_scale", "progress_reward_scale",
@@ -2199,3 +2273,507 @@ class MultiSceneEnvV13(MultiSceneEnvV12):
         self.active_scene_idx = scene_idx
         self.observation_space = env.observation_space
         self.action_space = env.action_space
+
+
+class MultiSceneEnvV16(MultiSceneEnvV13):
+    """
+    V16 多场景训练环境。
+    在 V13 双域语义观测链上，额外插入 obstacle runtime：
+      - reset 后按场景几何布置障碍车
+      - step 时向 info 注入 obstacle_dist / obstacle_risk / relative pose
+      - state 从 7D 扩为 12D（追加 obstacle context）
+    """
+
+    def __init__(
+        self,
+        env_ids: List[str],
+        conf: Dict[str, Any],
+        scene_weights: List[float],
+        scene_specs: Dict[str, Dict[str, str]],
+        track_geometry=None,
+        track_dir: str = "",
+        obstacle_enabled: bool = True,
+        obstacle_scene_keys: Optional[List[str]] = None,
+        obstacle_count: int = 2,
+        obstacle_free_prob: float = 0.15,
+        obstacle_modes: Optional[List[str]] = None,
+        ws_obstacle_free_prob: Optional[float] = None,
+        obstacle_spawn_ahead_min_m: float = 3.5,
+        obstacle_spawn_ahead_max_m: float = 14.0,
+        obstacle_min_agent_planar_dist_m: float = 1.5,
+        obstacle_min_agent_arc_dist_m: float = 3.5,
+        obstacle_min_separation_world: float = 3.0,
+        obstacle_lateral_choices: Optional[List[float]] = None,
+        obstacle_fixed_progress_ratio: Optional[float] = None,
+        obstacle_progress_min: Optional[float] = None,
+        obstacle_progress_max: Optional[float] = None,
+        obstacle_fixed_lateral_ratio: Optional[float] = None,
+        gt_obstacle_start_exclusion_half_width_m: Optional[float] = None,
+        ws_obstacle_modes: Optional[List[str]] = None,
+        ws_obstacle_fixed_progress_ratio: Optional[float] = None,
+        ws_obstacle_progress_min: Optional[float] = None,
+        ws_obstacle_progress_max: Optional[float] = None,
+        ws_obstacle_fixed_lateral_ratio: Optional[float] = None,
+        obstacle_randomize_non_lane_pid_yaw: bool = True,
+        obstacle_jitter_amplitude_m: float = 0.10,
+        obstacle_jitter_period_s: float = 1.5,
+        obstacle_jitter_update_hz: float = 8.0,
+        obstacle_nudge_amplitude_m: float = 0.14,
+        obstacle_nudge_period_s: float = 1.5,
+        obstacle_nudge_update_hz: float = 8.0,
+        obstacle_lane_pid_speed_gt: float = 0.85,
+        obstacle_lane_pid_speed_ws: float = 0.70,
+        obstacle_lane_pid_lookahead_m: float = 0.9,
+        obstacle_spawn_gap_s: float = 0.0,
+        obstacle_placement_timeout_s: float = 1.5,
+        obstacle_seed: Optional[int] = None,
+        ego_random_spawn: bool = False,
+        ego_spawn_lateral_ratio: float = 0.5,
+        ego_spawn_settle_steps: int = 3,
+        ego_spawn_settle_sleep_s: float = 0.05,
+        **kwargs,
+    ):
+        self.track_dir = str(track_dir or "")
+        self.obstacle_enabled = bool(obstacle_enabled)
+        self.obstacle_scene_keys = tuple(
+            str(x) for x in (
+                obstacle_scene_keys
+                if obstacle_scene_keys is not None
+                else ["waveshare", "generated_track"]
+            )
+        )
+        self.obstacle_count = int(max(1, obstacle_count))
+        self.obstacle_free_prob = float(np.clip(obstacle_free_prob, 0.0, 1.0))
+        self.ws_obstacle_free_prob = (
+            None
+            if ws_obstacle_free_prob is None
+            else float(np.clip(ws_obstacle_free_prob, 0.0, 1.0))
+        )
+        self.obstacle_modes = tuple(
+            str(x).strip().lower()
+            for x in (obstacle_modes if obstacle_modes is not None else ["static", "jitter"])
+            if str(x).strip()
+        ) or ("static",)
+        self.obstacle_spawn_ahead_min_m = float(max(0.2, obstacle_spawn_ahead_min_m))
+        self.obstacle_spawn_ahead_max_m = float(max(self.obstacle_spawn_ahead_min_m + 1e-3, obstacle_spawn_ahead_max_m))
+        self.obstacle_min_agent_planar_dist_m = float(max(0.2, obstacle_min_agent_planar_dist_m))
+        self.obstacle_min_agent_arc_dist_m = float(max(0.2, obstacle_min_agent_arc_dist_m))
+        self.obstacle_min_separation_world = float(max(0.0, obstacle_min_separation_world))
+        self.obstacle_lateral_choices = tuple(
+            float(np.clip(x, 0.0, 1.0))
+            for x in (obstacle_lateral_choices if obstacle_lateral_choices is not None else [0.35, 0.5, 0.65])
+        )
+        self.obstacle_fixed_progress_ratio = (
+            None
+            if obstacle_fixed_progress_ratio is None
+            else float(np.clip(obstacle_fixed_progress_ratio, 0.0, 1.0))
+        )
+        self.obstacle_progress_min = (
+            None
+            if obstacle_progress_min is None
+            else float(np.clip(obstacle_progress_min, 0.0, 1.0))
+        )
+        self.obstacle_progress_max = (
+            None
+            if obstacle_progress_max is None
+            else float(np.clip(obstacle_progress_max, 0.0, 1.0))
+        )
+        if (
+            self.obstacle_progress_min is not None
+            and self.obstacle_progress_max is not None
+            and self.obstacle_progress_max < self.obstacle_progress_min
+        ):
+            self.obstacle_progress_min, self.obstacle_progress_max = (
+                self.obstacle_progress_max,
+                self.obstacle_progress_min,
+            )
+        self.obstacle_fixed_lateral_ratio = (
+            None
+            if obstacle_fixed_lateral_ratio is None
+            else float(np.clip(obstacle_fixed_lateral_ratio, 0.0, 1.0))
+        )
+        self.gt_obstacle_start_exclusion_half_width_m = (
+            None
+            if gt_obstacle_start_exclusion_half_width_m is None
+            else float(max(0.0, gt_obstacle_start_exclusion_half_width_m))
+        )
+        self.ws_obstacle_modes = (
+            None
+            if ws_obstacle_modes is None
+            else tuple(
+                str(x).strip().lower()
+                for x in ws_obstacle_modes
+                if str(x).strip()
+            ) or None
+        )
+        self.ws_obstacle_fixed_progress_ratio = (
+            None
+            if ws_obstacle_fixed_progress_ratio is None
+            else float(np.clip(ws_obstacle_fixed_progress_ratio, 0.0, 1.0))
+        )
+        self.ws_obstacle_progress_min = (
+            None
+            if ws_obstacle_progress_min is None
+            else float(np.clip(ws_obstacle_progress_min, 0.0, 1.0))
+        )
+        self.ws_obstacle_progress_max = (
+            None
+            if ws_obstacle_progress_max is None
+            else float(np.clip(ws_obstacle_progress_max, 0.0, 1.0))
+        )
+        self.ws_obstacle_fixed_lateral_ratio = (
+            None
+            if ws_obstacle_fixed_lateral_ratio is None
+            else float(np.clip(ws_obstacle_fixed_lateral_ratio, 0.0, 1.0))
+        )
+        self.obstacle_randomize_non_lane_pid_yaw = bool(obstacle_randomize_non_lane_pid_yaw)
+        self.obstacle_jitter_amplitude_m = float(max(0.0, obstacle_jitter_amplitude_m))
+        self.obstacle_jitter_period_s = float(max(0.2, obstacle_jitter_period_s))
+        self.obstacle_jitter_update_hz = float(max(1.0, obstacle_jitter_update_hz))
+        self.obstacle_nudge_amplitude_m = float(max(0.0, obstacle_nudge_amplitude_m))
+        self.obstacle_nudge_period_s = float(max(0.2, obstacle_nudge_period_s))
+        self.obstacle_nudge_update_hz = float(max(1.0, obstacle_nudge_update_hz))
+        self.obstacle_lane_pid_speed_gt = float(max(0.0, obstacle_lane_pid_speed_gt))
+        self.obstacle_lane_pid_speed_ws = float(max(0.0, obstacle_lane_pid_speed_ws))
+        self.obstacle_lane_pid_lookahead_m = float(max(0.1, obstacle_lane_pid_lookahead_m))
+        self.obstacle_spawn_gap_s = float(max(0.0, obstacle_spawn_gap_s))
+        self.obstacle_placement_timeout_s = float(max(0.1, obstacle_placement_timeout_s))
+        self.obstacle_seed = obstacle_seed
+        self.ego_random_spawn = bool(ego_random_spawn)
+        self.ego_spawn_lateral_ratio = float(np.clip(ego_spawn_lateral_ratio, 0.0, 1.0))
+        self.ego_spawn_settle_steps = int(max(1, ego_spawn_settle_steps))
+        self.ego_spawn_settle_sleep_s = float(max(0.0, ego_spawn_settle_sleep_s))
+        self._obstacle_runtime = None
+
+        super().__init__(
+            env_ids=env_ids,
+            conf=conf,
+            scene_weights=scene_weights,
+            scene_specs=scene_specs,
+            track_geometry=track_geometry,
+            **kwargs,
+        )
+
+        # 步数预算统计（用于学习窗口补偿）
+        self._step_budget_stats = {
+            "ws": {
+                "episode_count": 0,
+                "window_with_obs_steps": 0,
+                "window_without_obs_steps": 0,
+            },
+            "gt": {
+                "episode_count": 0,
+                "window_with_obs_steps": 0,
+                "window_without_obs_steps": 0,
+            }
+        }
+        self._window_episode_threshold = 50
+        self._curriculum_phase = "warmup"  # 当前课程阶段，由train_v16更新
+
+
+    def _build_obstacle_runtime_config(self):
+        from .obstacle_runtime import ObstacleRuntimeConfig
+
+        return ObstacleRuntimeConfig(
+            enabled=self.obstacle_enabled,
+            active_scene_keys=self.obstacle_scene_keys,
+            obstacle_count=self.obstacle_count,
+            obstacle_free_prob=self.obstacle_free_prob,
+            obstacle_modes=self.obstacle_modes,
+            ws_obstacle_free_prob=self.ws_obstacle_free_prob,
+            min_obstacle_separation_world=self.obstacle_min_separation_world,
+            spawn_ahead_min_m=self.obstacle_spawn_ahead_min_m,
+            spawn_ahead_max_m=self.obstacle_spawn_ahead_max_m,
+            min_agent_planar_dist_m=self.obstacle_min_agent_planar_dist_m,
+            min_agent_arc_dist_m=self.obstacle_min_agent_arc_dist_m,
+            lateral_choices=self.obstacle_lateral_choices,
+            fixed_progress_ratio=self.obstacle_fixed_progress_ratio,
+            obstacle_progress_min=self.obstacle_progress_min,
+            obstacle_progress_max=self.obstacle_progress_max,
+            fixed_lateral_ratio=self.obstacle_fixed_lateral_ratio,
+            gt_obstacle_start_exclusion_half_width_m=self.gt_obstacle_start_exclusion_half_width_m,
+            ws_obstacle_modes=self.ws_obstacle_modes,
+            ws_obstacle_fixed_progress_ratio=self.ws_obstacle_fixed_progress_ratio,
+            ws_obstacle_progress_min=self.ws_obstacle_progress_min,
+            ws_obstacle_progress_max=self.ws_obstacle_progress_max,
+            ws_obstacle_fixed_lateral_ratio=self.ws_obstacle_fixed_lateral_ratio,
+            randomize_non_lane_pid_yaw=self.obstacle_randomize_non_lane_pid_yaw,
+            jitter_amplitude_m=self.obstacle_jitter_amplitude_m,
+            jitter_period_s=self.obstacle_jitter_period_s,
+            jitter_update_hz=self.obstacle_jitter_update_hz,
+            nudge_amplitude_m=self.obstacle_nudge_amplitude_m,
+            nudge_period_s=self.obstacle_nudge_period_s,
+            nudge_update_hz=self.obstacle_nudge_update_hz,
+            lane_pid_speed_gt=self.obstacle_lane_pid_speed_gt,
+            lane_pid_speed_ws=self.obstacle_lane_pid_speed_ws,
+            lane_pid_lookahead_m=self.obstacle_lane_pid_lookahead_m,
+            spawn_gap_s=self.obstacle_spawn_gap_s,
+            placement_timeout_s=self.obstacle_placement_timeout_s,
+            ego_random_spawn=self.ego_random_spawn,
+            ego_spawn_lateral_ratio=self.ego_spawn_lateral_ratio,
+            ego_spawn_settle_steps=self.ego_spawn_settle_steps,
+            ego_spawn_settle_sleep_s=self.ego_spawn_settle_sleep_s,
+            seed=self.obstacle_seed,
+        )
+
+    def _create_env(self, scene_idx: int):
+        import gym_donkeycar  # noqa: F401
+        from .wrappers import CanonicalSemanticWrapper
+        from .action_adapter import ActionAdapterWrapper
+        from .obstacle_runtime import ObstacleRuntimeManager, ScenarioObstacleWrapper
+
+        env_id = self.env_ids[scene_idx]
+        scene_specs = MultiSceneEnvV13._SCENE_SPECS
+        if env_id not in scene_specs:
+            raise KeyError(f"V16 unknown env_id: {env_id}")
+
+        spec = scene_specs[env_id]
+        level_name = spec["level_name"]
+        scene_key = spec["scene_key"]
+        logging_key = spec.get("logging_key", scene_key)
+        domain = self.scene_domains[scene_idx]
+
+        if self._base_env is None:
+            self._base_env = MultiSceneEnv._make_env_with_retry(env_id, self.conf, retries=2, retry_wait_s=1.5)
+            _install_custom_episode_over(self._base_env)
+            print(f"✅ 模拟器已启动，首个场景: {level_name}")
+            try:
+                MultiSceneEnv._force_reload_scene(self._base_env, level_name, preflight=True)
+            except Exception as e:
+                print(f"⚠️  场景预加载失败，将继续当前状态: {type(e).__name__}: {e}")
+        else:
+            if self._obstacle_runtime is not None and getattr(self._obstacle_runtime, "scene_key", "") != scene_key:
+                self._obstacle_runtime.close()
+            try:
+                MultiSceneEnv._force_reload_scene(self._base_env, level_name, preflight=False)
+            except Exception as e:
+                print(f"⚠️  场景切换失败: {type(e).__name__}: {e}")
+                print("🔁 尝试重启模拟器并恢复目标场景...")
+                if self._obstacle_runtime is not None:
+                    self._obstacle_runtime.close()
+                try:
+                    self._base_env.close()
+                except Exception:
+                    pass
+                self._base_env = None
+                self._base_env = MultiSceneEnv._make_env_with_retry(env_id, self.conf, retries=2, retry_wait_s=1.5)
+                _install_custom_episode_over(self._base_env)
+                MultiSceneEnv._force_reload_scene(self._base_env, level_name, preflight=True)
+
+        _scene_max_cte = spec.get("max_cte", self.conf.get("max_cte", 8.0))
+        _set_handler_max_cte(self._base_env, _scene_max_cte, logging_key)
+
+        if self._obstacle_runtime is None:
+            self._obstacle_runtime = ObstacleRuntimeManager(
+                track_geometry=self.track_geometry,
+                conf=self.conf,
+                track_dir=self.track_dir,
+                config=self._build_obstacle_runtime_config(),
+            )
+        self._obstacle_runtime.attach_scene(
+            base_env=self._base_env,
+            env_id=env_id,
+            scene_key=scene_key,
+            logging_key=logging_key,
+        )
+
+        env = ScenarioObstacleWrapper(self._base_env, runtime=self._obstacle_runtime)
+        env = CanonicalSemanticWrapper(
+            env,
+            domain=domain,
+            obs_size=self.obs_size,
+            augment=self.augment,
+            dropout_start_step=self.dropout_start_step,
+            dropout_ramp_steps=self.dropout_ramp_steps,
+            dropout_max_prob=self.yellow_dropout_prob,
+        )
+
+        if self.track_geometry is not None and hasattr(self.track_geometry, "scenes") \
+                and scene_key in self.track_geometry.scenes:
+            geo = self.track_geometry.scenes[scene_key]
+            cte_left = float(geo.cte_left)
+            cte_right = float(geo.cte_right)
+            cte_left_out = float(geo.cte_left_out)
+            cte_right_out = float(geo.cte_right_out)
+            coord_scale = float(geo.coord_scale)
+            cte_half_width = float(geo.cte_half_width)
+        else:
+            cte_left = 5.0
+            cte_right = -5.0
+            cte_left_out = 6.5
+            cte_right_out = -6.5
+            coord_scale = 8.0
+            cte_half_width = 4.6
+
+        _reward_kwargs = dict(
+            total_timesteps=self.total_timesteps,
+            action_safety_wrapper=None,
+            w_d=self.w_d, w_dd=self.w_dd, w_m=self.w_m, w_sat=self.w_sat,
+            w_time=self.w_time, w_center=self.w_center,
+            w_heading=self.w_heading, w_speed_ref=self.w_speed_ref,
+            speed_ref_vmin=self.speed_ref_vmin, speed_ref_vmax=self.speed_ref_vmax,
+            speed_ref_kappa_ref=self.speed_ref_kappa_ref,
+            lap_reward_scale=self.lap_reward_scale,
+            progress_reward_scale=self.progress_reward_scale,
+            survival_reward_scale=self.survival_reward_scale,
+            collision_penalty_base=self.collision_penalty_base,
+            offtrack_penalty_base=self.offtrack_penalty_base,
+            w_near_offtrack=self.w_near_offtrack,
+            near_offtrack_start_ratio=self.near_offtrack_start_ratio,
+            w_near_collision=self.w_near_collision,
+            near_collision_start_ratio=self.near_collision_start_ratio,
+            overtake_success_bonus=self.overtake_success_bonus,
+            cte_left=cte_left, cte_right=cte_right,
+            cte_left_out=cte_left_out, cte_right_out=cte_right_out,
+            coord_scale=coord_scale,
+            offtrack_leniency_ratio=self.offtrack_leniency_ratio,
+            offtrack_leniency_mult=self.offtrack_leniency_mult,
+            track_geometry=self.track_geometry,
+            scene_key=scene_key,
+            logging_key=logging_key,
+            cte_half_width=cte_half_width,
+            reset_env_done_grace_steps=self.reset_env_done_grace_steps,
+            reset_collision_grace_steps=self.reset_collision_grace_steps,
+        )
+        _ALLOWED_REWARD_OVERRIDES = {
+            "near_offtrack_start_ratio", "w_near_offtrack",
+            "w_near_collision", "near_collision_start_ratio",
+            "overtake_success_bonus",
+            "w_center", "w_heading",
+            "collision_penalty_base", "offtrack_penalty_base",
+            "survival_reward_scale", "progress_reward_scale",
+            "lap_reward_scale",
+            "cte_norm_scale",
+            "reward_decay_ref_steps",
+        }
+        _reward_overrides = spec.get("reward_overrides", {})
+        if _reward_overrides:
+            _applied = {}
+            for _k, _v in _reward_overrides.items():
+                if _k in _ALLOWED_REWARD_OVERRIDES:
+                    _reward_kwargs[_k] = _v
+                    _applied[_k] = _v
+            if _applied:
+                print(f"   [{logging_key}] reward_overrides: {_applied}")
+        reward_wrapper = DonkeyRewardWrapper(env, **_reward_kwargs)
+        env = reward_wrapper
+
+        action_safety = ActionSafetyWrapper(
+            env,
+            delta_max=self.delta_max,
+            enable_lpf=self.enable_lpf,
+            beta=self.beta,
+            adaptive_delta_max=self.adaptive_delta_max,
+            curve_delta_boost=self.curve_delta_boost,
+            curve_kappa_ref=self.curve_kappa_ref,
+            steer_intent_boost=self.steer_intent_boost,
+            hairpin_curve_ratio=self.hairpin_curve_ratio,
+            hairpin_min_delta_max=self.hairpin_min_delta_max,
+            hairpin_max_delta_max=self.hairpin_max_delta_max,
+        )
+        env = action_safety
+        reward_wrapper.action_safety_wrapper = action_safety
+
+        adapter = ActionAdapterWrapper(
+            env,
+            k_delta=self.adapter_k_delta,
+            lambda_bias=self.adapter_lambda_bias,
+            k_bias=self.adapter_k_bias,
+            steer_core_decay=self.adapter_steer_core_decay,
+            v_nominal=self.adapter_v_nominal,
+            k_turn=self.adapter_k_turn,
+            k_bias_speed=self.adapter_k_bias_speed,
+            alpha_speed=self.adapter_alpha_speed,
+            v_min=self.adapter_v_min,
+            v_max=self.adapter_v_max,
+            speed_kp=self.speed_kp,
+            speed_ki=self.speed_ki,
+            speed_kff=self.speed_kff,
+            control_dt=self.control_dt,
+            max_throttle=self.max_throttle,
+            allow_reverse=self.allow_reverse,
+        )
+        env = adapter
+
+        env = MultiInputObsWrapper(
+            env,
+            track_geometry=None,
+            scene_key=scene_key,
+            logging_key=logging_key,
+            domain=domain,
+            obs_size=self.obs_size,
+            image_channels=6,
+            include_cte_in_obs=False,
+            speed_vmax=self.speed_vmax,
+            control_wrapper=adapter,
+            action_safety_wrapper=action_safety,
+            state_builder=_build_state_v16,
+            state_dim=12,
+            snapshot_dir=self.snapshot_dir,
+            snapshot_max_steps=self.snapshot_max_steps,
+        )
+
+        env = Monitor(env, info_keywords=MONITOR_INFO_KEYS)
+
+        self.action_safety_wrapper = action_safety
+        self.action_adapter_wrapper = adapter
+        self.reward_wrapper = reward_wrapper
+        self.active_env = env
+        self.active_scene_idx = scene_idx
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+
+    def reset(self, **kwargs):
+        """重写reset以跟踪step预算统计"""
+        obs = super().reset(**kwargs)
+
+        # 从self中获取scene_key信息（MultiSceneEnv的属性）
+        if hasattr(self, 'scene_key'):
+            scene_key = self.scene_key
+        else:
+            scene_key = "unknown"
+
+        if hasattr(self, 'logging_key'):
+            logging_key = self.logging_key
+        else:
+            logging_key = scene_key
+
+        # 使用logging_key (ws/gt) 来统计
+        if logging_key in self._step_budget_stats:
+            self._step_budget_stats[logging_key]["episode_count"] += 1
+
+            # 检查是否达到窗口阈值，需要重置窗口
+            if self._step_budget_stats[logging_key]["episode_count"] % self._window_episode_threshold == 0:
+                self._step_budget_stats[logging_key]["window_with_obs_steps"] = 0
+                self._step_budget_stats[logging_key]["window_without_obs_steps"] = 0
+
+        return obs
+
+    def step(self, action):
+        """重写step以跟踪step预算统计"""
+        obs, reward, done, info = super().step(action)
+
+        # 检查本步是否有障碍
+        scene_key = info.get("scene_key", "unknown")
+        logging_key = info.get("logging_key", scene_key)
+
+        # 从info中检测是否有活跃的障碍（通过obstacle_dist > 0或接近碰撞标志）
+        has_obstacle = False
+        if "obstacle_dist" in info and info["obstacle_dist"] > 0:
+            has_obstacle = True
+        elif "near_collision" in info and info["near_collision"] > 0:
+            has_obstacle = True
+
+        # 统计步数
+        if logging_key in self._step_budget_stats:
+            if has_obstacle:
+                self._step_budget_stats[logging_key]["window_with_obs_steps"] += 1
+            else:
+                self._step_budget_stats[logging_key]["window_without_obs_steps"] += 1
+
+        return obs, reward, done, info
+
+    def close(self):
+        if self._obstacle_runtime is not None:
+            self._obstacle_runtime.close()
+        super().close()

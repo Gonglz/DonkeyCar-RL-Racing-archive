@@ -504,3 +504,62 @@ def _build_state_v13(
         float(np.clip(steer_core,    -1.0,  1.0)),     # steer_core
         float(np.clip(bias_smooth,   -1.0,  1.0)),     # bias_smooth
     ], dtype=np.float32)
+
+
+def _build_state_v16(
+    info: Dict[str, Any],
+    action_safety_wrapper,
+    control_wrapper,
+    v_max: float = 2.2,
+) -> np.ndarray:
+    """
+    V16 state = V13 7D core + 5D obstacle context:
+      [base_7,
+       obstacle_present,
+       obstacle_longitudinal_norm,
+       obstacle_lateral_norm,
+       obstacle_dist_norm,
+       obstacle_risk]
+
+    设计原则：
+    - 保留 V13 的控制内态，避免 action adapter 学习重置
+    - 障碍信息来自 runtime wrapper 注入的 info，不依赖赛道几何
+    - 当本步无障碍信号时，新增 5 维全部退化为 0
+    """
+    base = _build_state_v13(
+        info=info,
+        action_safety_wrapper=action_safety_wrapper,
+        control_wrapper=control_wrapper,
+        v_max=v_max,
+    )
+
+    try:
+        obstacle_present = float(info.get("obstacle_present", 0.0) or 0.0)
+    except Exception:
+        obstacle_present = 0.0
+    try:
+        obstacle_longitudinal = float(info.get("obstacle_longitudinal", 0.0) or 0.0)
+    except Exception:
+        obstacle_longitudinal = 0.0
+    try:
+        obstacle_lateral = float(info.get("obstacle_lateral", 0.0) or 0.0)
+    except Exception:
+        obstacle_lateral = 0.0
+    try:
+        obstacle_dist = float(info.get("obstacle_dist", 0.0) or 0.0)
+    except Exception:
+        obstacle_dist = 0.0
+    try:
+        obstacle_risk = float(info.get("obstacle_risk", 0.0) or 0.0)
+    except Exception:
+        obstacle_risk = 0.0
+
+    obstacle_state = np.array([
+        float(np.clip(obstacle_present, 0.0, 1.0)),
+        float(np.clip(obstacle_longitudinal / 6.0, -2.0, 2.0)),
+        float(np.clip(obstacle_lateral / 2.5, -2.0, 2.0)),
+        float(np.clip(obstacle_dist / 6.0, 0.0, 2.0)),
+        float(np.clip(obstacle_risk, 0.0, 1.0)),
+    ], dtype=np.float32)
+
+    return np.concatenate([base, obstacle_state], axis=0).astype(np.float32)

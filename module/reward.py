@@ -8,7 +8,7 @@ DonkeyRewardWrapper：DonkeyCar 统一奖励包装器。
 
 import math
 from collections import deque
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import gym
 import numpy as np
@@ -33,6 +33,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
       time          = -w_time
       near_offtrack = 出界前线性惩罚（cte 接近 out 边界）
       near_collision= 碰撞前风险线性惩罚（obstacle/heading/speed/control）
+      overtake      = 成功绕过并超过障碍车后的 bonus
       collision     = 碰撞/stuck/offtrack 终止惩罚
       smooth        = -w_d  * |Δsteer_exec|
       jerk          = -w_dd * |jerk|
@@ -76,6 +77,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
         near_offtrack_start_ratio: float = 0.45,
         w_near_collision: float = 0.35,
         near_collision_start_ratio: float = 0.65,
+        overtake_success_bonus: float = 2.5,
         cte_left: float = 5.0,
         cte_right: float = -5.0,
         cte_left_out: Optional[float] = None,
@@ -92,6 +94,8 @@ class DonkeyRewardWrapper(gym.Wrapper):
         enable_step_diagnostics: bool = False,
         step_diagnostics_first_steps: int = 3,
         step_diagnostics_every_episodes: int = 0,
+        reset_env_done_grace_steps: int = 0,
+        reset_collision_grace_steps: int = 0,
     ):
         super().__init__(env)
         self.total_timesteps = total_timesteps
@@ -106,6 +110,8 @@ class DonkeyRewardWrapper(gym.Wrapper):
         self.enable_step_diagnostics = bool(enable_step_diagnostics)
         self.step_diagnostics_first_steps = max(1, int(step_diagnostics_first_steps))
         self.step_diagnostics_every_episodes = max(0, int(step_diagnostics_every_episodes))
+        self.reset_env_done_grace_steps = max(0, int(reset_env_done_grace_steps))
+        self.reset_collision_grace_steps = max(0, int(reset_collision_grace_steps))
         self._episode_index = 0
 
         # reward decay: 长 episode 每步奖励递减，抑制总回报线性膨胀
@@ -143,10 +149,17 @@ class DonkeyRewardWrapper(gym.Wrapper):
         self.near_offtrack_start_ratio = float(np.clip(near_offtrack_start_ratio, 0.0, 0.98))
         self.w_near_collision = float(max(0.0, w_near_collision))
         self.near_collision_start_ratio = float(np.clip(near_collision_start_ratio, 0.0, 0.98))
+        self.overtake_success_bonus = float(max(0.0, overtake_success_bonus))
         # 固定 10 步渐进惩罚：风险触发后，从第1步到第10步线性增强到满惩罚。
         self.near_penalty_ramp_steps = 10
         self._near_offtrack_ramp_step = 0
         self._near_collision_ramp_step = 0
+        self.overtake_arm_longitudinal_min_m = 0.8
+        self.overtake_arm_planar_max_m = 8.0
+        self.overtake_pass_longitudinal_threshold_m = -0.8
+        self.overtake_pass_planar_min_m = 0.9
+        self.overtake_min_front_steps = 4
+        self.overtake_rearm_cooldown_steps = 12
 
         self.smooth_stats: deque = deque(maxlen=1000)
 
@@ -176,6 +189,11 @@ class DonkeyRewardWrapper(gym.Wrapper):
         self.offtrack_counter = 0
         self.episode_stats: Dict[str, Any] = self._zero_episode_stats()
         self.prev_lap_count = 0
+        self._episode_overtake_count = 0
+        self._overtake_front_steps = 0
+        self._overtake_armed = False
+        self._overtake_cooldown_steps_left = 0
+        self._overtake_last_longitudinal: Optional[float] = None
 
         _side_method = "lat_err * coord_scale（精确）" if track_geometry and scene_key else "-sim_cte（近似 fallback）"
         print(
@@ -197,8 +215,19 @@ class DonkeyRewardWrapper(gym.Wrapper):
         print(f"   CTE 归一化: half_width={self.cte_half_width:.2f}, norm_scale={self.cte_norm_scale:.3f} (ref={CTE_REF_HALF_WIDTH})")
         print(f"   左右侧判断: {_side_method}")
         print(f"   offtrack done 课程: 前 {self._leniency_steps:,} 步 done阈值 {self._leniency_mult:.1f}x → 1.0x  (惩罚始终生效)")
+        if self.overtake_success_bonus > 0.0:
+            print(
+                f"   overtake_bonus: +{self.overtake_success_bonus:.2f} "
+                f"(front>={self.overtake_arm_longitudinal_min_m:.1f}m for {self.overtake_min_front_steps} steps, "
+                f"behind<={self.overtake_pass_longitudinal_threshold_m:.1f}m)"
+            )
         if self.reward_decay_ref_steps > 0:
             print(f"   reward_decay: ref_steps={self.reward_decay_ref_steps} (超过后每步奖励按 ref/step 衰减)")
+        if self.reset_env_done_grace_steps > 0 or self.reset_collision_grace_steps > 0:
+            print(
+                f"   reset保护: env_done前{self.reset_env_done_grace_steps}步忽略, "
+                f"collision前{self.reset_collision_grace_steps}步忽略"
+            )
 
         # 奖励分项累计（每个 episode 重置）—— 供 Monitor → PerSceneStatsCallback 使用
         self._reward_parts_episode: Dict[str, float] = self._zero_reward_parts()
@@ -297,7 +326,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
         return {
             "survival": 0.0, "speed": 0.0, "cte": 0.0, "collision": 0.0,
             "near_offtrack": 0.0, "near_collision": 0.0,
-            "progress": 0.0, "lap": 0.0, "lap_raw": 0.0, "smooth": 0.0, "jerk": 0.0,
+            "progress": 0.0, "lap": 0.0, "lap_raw": 0.0, "overtake": 0.0, "smooth": 0.0, "jerk": 0.0,
             "mismatch": 0.0, "center": 0.0, "heading": 0.0, "speed_ref": 0.0, "time": 0.0,
             "sat": 0.0, "total": 0.0,
         }
@@ -353,7 +382,48 @@ class DonkeyRewardWrapper(gym.Wrapper):
             "collision": False,
             "total_reward": 0.0,
             "cte_violations": 0,
+            "overtake_count": 0,
         }
+
+    @staticmethod
+    def _extract_obstacle_relative_state(info: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        try:
+            present = float(info.get("obstacle_present", 0.0) or 0.0)
+        except Exception:
+            present = 0.0
+        try:
+            longitudinal = float(info.get("obstacle_longitudinal", np.nan))
+        except Exception:
+            longitudinal = float("nan")
+        try:
+            lateral = float(info.get("obstacle_lateral", np.nan))
+        except Exception:
+            lateral = float("nan")
+        try:
+            planar_distance = float(info.get("obstacle_dist", np.nan))
+        except Exception:
+            planar_distance = float("nan")
+        if (not np.isfinite(planar_distance)) and np.isfinite(longitudinal) and np.isfinite(lateral):
+            planar_distance = float(math.hypot(longitudinal, lateral))
+        return float(present), float(longitudinal), float(lateral), float(planar_distance)
+
+    def _unwrap_base_env(self):
+        base = self.env
+        depth = 0
+        while hasattr(base, "env") and depth < 32:
+            base = base.env
+            depth += 1
+        return base
+
+    def _clear_base_handler_over(self) -> None:
+        try:
+            base = self._unwrap_base_env()
+            viewer = getattr(base, "viewer", None)
+            handler = getattr(viewer, "handler", None)
+            if handler is not None:
+                handler.over = False
+        except Exception:
+            pass
 
     def reset(self, **kwargs):
         self.episode_stats = self._zero_episode_stats()
@@ -365,6 +435,11 @@ class DonkeyRewardWrapper(gym.Wrapper):
         self._prev_track_idx = None
         self._near_offtrack_ramp_step = 0
         self._near_collision_ramp_step = 0
+        self._episode_overtake_count = 0
+        self._overtake_front_steps = 0
+        self._overtake_armed = False
+        self._overtake_cooldown_steps_left = 0
+        self._overtake_last_longitudinal = None
         self._reward_parts_episode = self._zero_reward_parts()
         self._episode_diag = self._zero_episode_diag()
         self._episode_index += 1
@@ -382,6 +457,21 @@ class DonkeyRewardWrapper(gym.Wrapper):
         prev_reason = str(info.get("termination_reason", "") or "").strip()
         if prev_reason and prev_reason != "normal":
             term_reasons.append(prev_reason)
+        episode_step = int(self.episode_stats["steps"]) + 1
+        reset_env_done_grace_active = (
+            self.reset_env_done_grace_steps > 0
+            and episode_step <= self.reset_env_done_grace_steps
+        )
+        reset_collision_grace_active = (
+            self.reset_collision_grace_steps > 0
+            and episode_step <= self.reset_collision_grace_steps
+        )
+        env_done_masked = False
+        collision_masked = False
+        if env_done_before_processing and reset_env_done_grace_active:
+            done = False
+            env_done_masked = True
+            self._clear_base_handler_over()
 
         cte_signed = float(info.get("cte", 0))
         cte_abs    = abs(cte_signed)
@@ -536,16 +626,31 @@ class DonkeyRewardWrapper(gym.Wrapper):
         # Terminal penalty（仅记录真正的终止惩罚；near_* 单独累计）
         terminal_penalty = 0.0
         if hit != "none":
-            terminal_penalty = -self.collision_penalty_base
-            self.episode_stats["collision"] = True
-            done = True
-            term_reasons.append("collision")
+            if reset_collision_grace_active:
+                collision_masked = True
+                if env_done_before_processing:
+                    done = False
+                    env_done_masked = True
+                self._clear_base_handler_over()
+            else:
+                terminal_penalty = -self.collision_penalty_base
+                self.episode_stats["collision"] = True
+                done = True
+                term_reasons.append("collision")
 
         # Lap reward（合并 sim 计圈和软件计圈，取较大值）
         effective_lap_count = max(lap_count, self._soft_lap_count)
         lap_reward = 0.0
         lap_reward_raw = 0.0
-        if effective_lap_count > self.prev_lap_count:
+        # WS无障碍episode用更短的圈数上限：
+        # 有障碍时ep_len≈200步，无障碍时ep_len≈1300步，步数严重倾斜（有障碍仅占18%步数）
+        # 无障碍WS限制3圈done，让两类episode步数接近，提升有障碍的学习信号比例
+        obstacle_active = float(info.get("obstacle_runtime_active", 1.0))
+        if self._scene_key == "waveshare" and obstacle_active < 0.5:
+            MAX_LAPS_FOR_REWARD = 3  # WS无障碍：3圈done
+        else:
+            MAX_LAPS_FOR_REWARD = 5  # WS有障碍 / GT：5圈done
+        if effective_lap_count > self.prev_lap_count and effective_lap_count <= MAX_LAPS_FOR_REWARD:
             # 每步最多按 1 圈计奖，避免计数抖动造成奖励尖峰
             laps_completed_raw = effective_lap_count - self.prev_lap_count
             laps_completed = int(max(0, min(laps_completed_raw, 1)))
@@ -559,6 +664,14 @@ class DonkeyRewardWrapper(gym.Wrapper):
                 f"scale={self.lap_reward_scale:.2f}, "
                 f"sim_lap={lap_count}, soft_lap={self._soft_lap_count})"
             )
+        elif effective_lap_count > MAX_LAPS_FOR_REWARD:
+            # 超过上限，不再给奖励，但更新prev_lap_count避免重复计数
+            self.prev_lap_count = effective_lap_count
+
+        # ★ 圈数上限到达后立即终止 episode
+        if effective_lap_count >= MAX_LAPS_FOR_REWARD:
+            done = True
+            term_reasons.append("max_laps_reached")
 
         # Stuck 检测（速度 < 0.1，连续 30 步后逐步增加惩罚）
         if ontrack and speed < 0.1:
@@ -684,6 +797,85 @@ class DonkeyRewardWrapper(gym.Wrapper):
         info["reward_debug/near_collision_risk"] = float(near_collision_risk)
         info["reward_debug/r_near_collision"] = float(near_collision_penalty)
 
+        overtake_bonus = 0.0
+        overtake_success = False
+        obstacle_present, obstacle_longitudinal, _obstacle_lateral, obstacle_planar_distance = (
+            self._extract_obstacle_relative_state(info)
+        )
+        obstacle_available = bool(obstacle_present > 0.5 and np.isfinite(obstacle_longitudinal))
+        obstacle_planar_ok = bool(np.isfinite(obstacle_planar_distance) and obstacle_planar_distance > 0.0)
+        if self._overtake_cooldown_steps_left > 0:
+            self._overtake_cooldown_steps_left -= 1
+
+        encounter_front = bool(
+            obstacle_available
+            and obstacle_longitudinal >= self.overtake_arm_longitudinal_min_m
+            and (
+                (not obstacle_planar_ok)
+                or obstacle_planar_distance <= self.overtake_arm_planar_max_m
+            )
+        )
+        if encounter_front:
+            self._overtake_front_steps += 1
+            if (
+                self._overtake_front_steps >= self.overtake_min_front_steps
+                and self._overtake_cooldown_steps_left <= 0
+            ):
+                self._overtake_armed = True
+        elif not self._overtake_armed:
+            self._overtake_front_steps = 0
+
+        safe_overtake_state = bool(
+            (not done)
+            and (cte_over_out <= 0.5)
+            and (speed > 0.2)
+            and ("collision" not in term_reasons)
+            and ("offtrack" not in term_reasons)
+            and ("stuck" not in term_reasons)
+        )
+        passed_to_back = bool(
+            obstacle_available
+            and obstacle_longitudinal <= self.overtake_pass_longitudinal_threshold_m
+            and (
+                (not obstacle_planar_ok)
+                or obstacle_planar_distance >= self.overtake_pass_planar_min_m
+            )
+        )
+        crossed_from_front = bool(
+            self._overtake_last_longitudinal is not None
+            and self._overtake_last_longitudinal >= 0.0
+        )
+        if (
+            self.overtake_success_bonus > 0.0
+            and self._overtake_armed
+            and safe_overtake_state
+            and passed_to_back
+            and (crossed_from_front or self._overtake_front_steps >= self.overtake_min_front_steps)
+        ):
+            overtake_bonus = float(self.overtake_success_bonus)
+            overtake_success = True
+            self._episode_overtake_count += 1
+            self.episode_stats["overtake_count"] = int(self._episode_overtake_count)
+            self._overtake_armed = False
+            self._overtake_front_steps = 0
+            self._overtake_cooldown_steps_left = self.overtake_rearm_cooldown_steps
+        elif done and (("collision" in term_reasons) or ("offtrack" in term_reasons) or ("stuck" in term_reasons)):
+            self._overtake_armed = False
+            self._overtake_front_steps = 0
+
+        self._overtake_last_longitudinal = (
+            float(obstacle_longitudinal) if obstacle_available else None
+        )
+        info["overtake_success"] = bool(overtake_success)
+        info["overtake_bonus"] = float(overtake_bonus)
+        info["overtake_count"] = int(self._episode_overtake_count)
+        info["reward_debug/overtake_armed"] = float(self._overtake_armed)
+        info["reward_debug/overtake_front_steps"] = float(self._overtake_front_steps)
+        info["reward_debug/overtake_cooldown"] = float(self._overtake_cooldown_steps_left)
+        info["reward_debug/overtake_obstacle_longitudinal"] = float(obstacle_longitudinal)
+        info["reward_debug/overtake_obstacle_planar_distance"] = float(obstacle_planar_distance)
+        info["reward_debug/r_overtake"] = float(overtake_bonus)
+
         # 调试日志
         info["reward_debug/survival"]         = survival_reward
         info["reward_debug/speed_gate"]       = speed_gate
@@ -697,6 +889,10 @@ class DonkeyRewardWrapper(gym.Wrapper):
         info["reward_debug/cte_abs"]          = float(lat_err_cte_abs)
         info["reward_debug/cte_over_in"]      = float(cte_over_in)
         info["reward_debug/cte_over_out"]     = float(cte_over_out)
+        info["reward_debug/reset_env_done_grace_active"] = float(reset_env_done_grace_active)
+        info["reward_debug/reset_collision_grace_active"] = float(reset_collision_grace_active)
+        info["reward_debug/reset_env_done_masked"] = float(env_done_masked)
+        info["reward_debug/reset_collision_masked"] = float(collision_masked)
         self._episode_diag["offtrack_counter_max"] = max(
             int(self._episode_diag["offtrack_counter_max"]),
             int(self.offtrack_counter),
@@ -784,7 +980,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
             survival_reward + speed_reward + progress_reward + cte_term +
             center_penalty + heading_penalty + speed_ref_penalty + time_penalty +
             terminal_penalty + near_offtrack_penalty + near_collision_penalty + lap_reward +
-            smooth_penalty + jerk_penalty + mismatch_penalty + sat_penalty +
+            overtake_bonus + smooth_penalty + jerk_penalty + mismatch_penalty + sat_penalty +
             throttle_high_penalty
         )
 
@@ -810,6 +1006,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
         self._reward_parts_episode["near_collision"] += near_collision_penalty
         self._reward_parts_episode["lap"]       += lap_reward
         self._reward_parts_episode["lap_raw"]   += lap_reward_raw
+        self._reward_parts_episode["overtake"]  += overtake_bonus
         self._reward_parts_episode["smooth"]    += smooth_penalty
         self._reward_parts_episode["jerk"]      += jerk_penalty
         self._reward_parts_episode["mismatch"]  += mismatch_penalty
@@ -830,6 +1027,8 @@ class DonkeyRewardWrapper(gym.Wrapper):
             info["ep_r_near_collision"] = self._reward_parts_episode["near_collision"]
             info["ep_r_lap"]       = self._reward_parts_episode["lap"]
             info["ep_r_lap_raw"]   = self._reward_parts_episode["lap_raw"]
+            info["ep_r_overtake"]  = self._reward_parts_episode["overtake"]
+            info["ep_overtake_count"] = int(self._episode_overtake_count)
             info["ep_soft_lap_count"] = self._soft_lap_count
             info["ep_r_smooth"]    = self._reward_parts_episode["smooth"]
             info["ep_r_jerk"]      = self._reward_parts_episode["jerk"]
@@ -890,7 +1089,7 @@ class DonkeyRewardWrapper(gym.Wrapper):
                     dedup.append(r)
             info["termination_reason"] = "+".join(dedup)
         else:
-            if env_done_before_processing:
+            if env_done_before_processing and (not env_done_masked):
                 info.setdefault("termination_reason", "env_done")
             else:
                 info.setdefault("termination_reason", "normal")

@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -74,9 +74,7 @@ _UNITY_WORLD_SCALE = 8.0
 _DEFAULT_WORLD_Y = 0.5
 _DEFAULT_TRACK_PROFILE_DIR = MODULE_TRACK_DATA_DIR
 _DEFAULT_OBSTACLE_BODY_RGBS: Tuple[Tuple[int, int, int], ...] = (
-    (255, 80, 80),
-    (80, 220, 120),
-    (80, 150, 255),
+    (0, 255, 0),
 )
 
 
@@ -189,6 +187,10 @@ class TrackTarget:
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _with_target_yaw(target: TrackTarget, yaw_deg: float) -> TrackTarget:
+    return replace(target, yaw_deg=float(_wrap_deg(yaw_deg)))
 
 
 @dataclass(frozen=True)
@@ -836,6 +838,7 @@ class DonkeyObstacleCar:
         amplitude_m: float = 0.10,
         period_s: float = 1.5,
         update_hz: float = 8.0,
+        yaw_deg_override: Optional[float] = None,
         y: float = 0.0,
         obstacle_radius: float = 0.25,
         safety_margin: float = 0.05,
@@ -848,12 +851,15 @@ class DonkeyObstacleCar:
             obstacle_radius=obstacle_radius,
             safety_margin=safety_margin,
         )
-        self._teleport_raw(
+        if yaw_deg_override is not None:
+            anchor = _with_target_yaw(anchor, float(yaw_deg_override))
+        self.place_pose(
             x=anchor.x,
             z=anchor.z,
             yaw_deg=anchor.yaw_deg,
             world_y=self.default_world_y,
             hold_brake=True,
+            timeout_s=self.placement_timeout_s,
         )
         with self._lock:
             self._clear_dynamic_modes_locked()
@@ -878,6 +884,7 @@ class DonkeyObstacleCar:
         amplitude_m: float = 0.14,
         period_s: float = 1.5,
         update_hz: float = 8.0,
+        yaw_deg_override: Optional[float] = None,
         y: float = 0.0,
         obstacle_radius: float = 0.25,
         safety_margin: float = 0.05,
@@ -890,12 +897,15 @@ class DonkeyObstacleCar:
             obstacle_radius=obstacle_radius,
             safety_margin=safety_margin,
         )
-        self._teleport_raw(
+        if yaw_deg_override is not None:
+            anchor = _with_target_yaw(anchor, float(yaw_deg_override))
+        self.place_pose(
             x=anchor.x,
             z=anchor.z,
             yaw_deg=anchor.yaw_deg,
             world_y=self.default_world_y,
             hold_brake=True,
+            timeout_s=self.placement_timeout_s,
         )
         with self._lock:
             self._clear_dynamic_modes_locked()
@@ -1003,6 +1013,7 @@ class DonkeyObstacleCar:
         self,
         progress_ratio: float,
         lateral_ratio: float = 0.5,
+        yaw_deg_override: Optional[float] = None,
         y: float = 0.0,
         obstacle_radius: float = 0.25,
         safety_margin: float = 0.05,
@@ -1023,6 +1034,8 @@ class DonkeyObstacleCar:
             obstacle_radius=obstacle_radius,
             safety_margin=safety_margin,
         )
+        if yaw_deg_override is not None:
+            target = _with_target_yaw(target, float(yaw_deg_override))
         with self._lock:
             self._clear_dynamic_modes_locked()
             self._target = target
@@ -1050,6 +1063,7 @@ class DonkeyObstacleCar:
         self,
         progress_ratio: float,
         lateral_ratio: float = 0.5,
+        yaw_deg_override: Optional[float] = None,
         y: float = 0.0,
         obstacle_radius: float = 0.25,
         safety_margin: float = 0.05,
@@ -1059,6 +1073,7 @@ class DonkeyObstacleCar:
         return self.set_track_target(
             progress_ratio=progress_ratio,
             lateral_ratio=lateral_ratio,
+            yaw_deg_override=yaw_deg_override,
             y=y,
             obstacle_radius=obstacle_radius,
             safety_margin=safety_margin,
@@ -1213,13 +1228,14 @@ class DonkeyObstacleCar:
             raise ValueError("track_geometry is required for arc-offset obstacle motion")
         g = self.track_geometry.scenes[anchor.scene_key]
         progress_ratio = float(anchor.progress_ratio + float(delta_s_m) / max(float(g.loop_len), 1e-6))
-        return sample_track_target(
+        target = sample_track_target(
             track_geometry=self.track_geometry,
             scene_key=anchor.scene_key,
             progress_ratio=progress_ratio,
             lateral_ratio=float(anchor.lateral_ratio),
             y=anchor.y,
         )
+        return _with_target_yaw(target, float(anchor.yaw_deg))
 
     @staticmethod
     def _sample_target_with_local_offset(anchor: TrackTarget, longitudinal_m: float) -> TrackTarget:
@@ -1651,6 +1667,7 @@ def spawn_preset_obstacle_fleet(
     hold_brake: bool = True,
     spawn_gap: float = 0.0,
     placement_timeout_s: float = 1.5,
+    initial_place: bool = True,
 ) -> DonkeyObstacleFleet:
     """
     生成一组静态障碍车。
@@ -1712,7 +1729,7 @@ def spawn_preset_obstacle_fleet(
                 scene_key=preset.scene_key,
                 host=host,
                 port=int(port),
-                body_style="donkey",
+                body_style="bare" if preset.name == "ws" else "donkey",
                 body_rgb=color,
                 car_name=f"{preset.name}_obstacle_{i}",
                 racer_name=f"{preset.name.upper()}-Obs-{i}",
@@ -1731,15 +1748,15 @@ def spawn_preset_obstacle_fleet(
             if spawn_gap > 0.0:
                 time.sleep(float(spawn_gap))
 
-        for car, target in zip(cars, targets):
-            car.teleport_pose(
-                x=target.x,
-                z=target.z,
-                yaw_deg=target.yaw_deg,
-                hold_brake=hold_brake,
-            )
-
-        time.sleep(0.6)
+        if initial_place:
+            for car, target in zip(cars, targets):
+                car.teleport_pose(
+                    x=target.x,
+                    z=target.z,
+                    yaw_deg=target.yaw_deg,
+                    hold_brake=hold_brake,
+                )
+            time.sleep(0.6)
         return DonkeyObstacleFleet(
             preset=preset,
             track_geometry=track_geometry,

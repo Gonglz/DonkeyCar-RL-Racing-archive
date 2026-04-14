@@ -94,7 +94,8 @@ class PerSceneStatsCallback(BaseCallback):
         "ep_r_survival", "ep_r_speed", "ep_r_progress", "ep_r_cte", "ep_r_collision",
         "ep_r_near_offtrack", "ep_r_near_collision",
         "ep_r_center", "ep_r_heading", "ep_r_speed_ref", "ep_r_time",
-        "ep_r_lap", "ep_r_lap_raw", "ep_soft_lap_count", "ep_r_smooth", "ep_r_jerk",
+        "ep_r_lap", "ep_r_lap_raw", "ep_r_overtake", "ep_overtake_count",
+        "ep_soft_lap_count", "ep_r_smooth", "ep_r_jerk",
         "ep_r_mismatch", "ep_r_sat", "ep_r_total",
     )
     DIAG_EP_KEYS = (
@@ -1129,3 +1130,261 @@ class TqdmProgressCallback(BaseCallback):
             self.pbar.update(self.num_timesteps - self._last_update)
             self.pbar.close()
             self.pbar = None
+
+
+# ============================================================
+# 步数平衡采样：动态调整障碍物概率以补充缺失的障碍物步数
+# ============================================================
+class ObstacleStepsBalancingCallback(BaseCallback):
+    """
+    根据步数补充障碍物回合。
+
+    逻辑：
+    - 目标障碍物步数 = 总步数 × (1 - obstacle_free_prob)
+    - 跟踪：实际带障碍物的步数
+    - 补充：如果缺失，动态降低 obstacle_free_prob 来增加后续障碍物出现概率
+    """
+
+    def __init__(
+        self,
+        check_freq: int = 1000,
+        target_obstacle_ratio: float = 0.5,  # 50% 的步数应该带障碍物
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.check_freq = max(1, int(check_freq))
+        self.target_obstacle_ratio = float(np.clip(target_obstacle_ratio, 0.0, 1.0))
+
+        # Per-scene tracking
+        self._scene_total_steps: Dict[str, int] = {}
+        self._scene_obstacle_steps: Dict[str, int] = {}
+        self._scene_obstacle_free_prob: Dict[str, float] = {}
+        self._last_check_step = 0
+
+    def _on_training_start(self) -> None:
+        # 初始化场景
+        for scene_key in ['ws', 'gt']:
+            self._scene_total_steps[scene_key] = 0
+            self._scene_obstacle_steps[scene_key] = 0
+            # 从env获取初始obstacle_free_prob
+            if hasattr(self.model.env, 'envs'):
+                # VecEnv
+                for env in self.model.env.envs:
+                    if hasattr(env, 'obstacle_free_prob'):
+                        self._scene_obstacle_free_prob[scene_key] = env.obstacle_free_prob
+                        break
+            elif hasattr(self.model.env, 'obstacle_free_prob'):
+                self._scene_obstacle_free_prob[scene_key] = self.model.env.obstacle_free_prob
+
+    def _on_step(self) -> bool:
+        # 从ep_info_buffer中提取信息
+        if len(self.model.ep_info_buffer) > 0 and self.num_timesteps - self._last_check_step >= self.check_freq:
+            self._last_check_step = self.num_timesteps
+
+            # 处理最近的episodes
+            for ep in self.model.ep_info_buffer:
+                scene_key = ep.get('logging_key') or 'unknown'
+                ep_len = ep.get('l', 0)  # episode length
+
+                if scene_key in self._scene_total_steps:
+                    self._scene_total_steps[scene_key] += ep_len
+
+                    # 检查是否有障碍物（通过碰撞或near_collision信息推断）
+                    # 简单启发：如果reward中有碰撞或near_collision惩罚，说明有障碍物
+                    has_obstacle = 'ep_term_collision' in ep or 'ep_r_near_collision' in ep
+                    if has_obstacle:
+                        self._scene_obstacle_steps[scene_key] += ep_len
+
+            # 根据缺失程度调整obstacle_free_prob
+            self._adjust_obstacle_probs()
+
+        return True
+
+    def _adjust_obstacle_probs(self) -> None:
+        """根据缺失的障碍物步数，动态调整obstacle_free_prob"""
+
+        for scene_key in ['ws', 'gt']:
+            total = self._scene_total_steps.get(scene_key, 0)
+            obstacle = self._scene_obstacle_steps.get(scene_key, 0)
+
+            if total < 100:  # 数据太少，不调整
+                continue
+
+            # 计算目标和实际的障碍物步数
+            target_obstacle_steps = total * self.target_obstacle_ratio
+            actual_ratio = obstacle / total if total > 0 else 0
+
+            # 如果缺失过多，降低obstacle_free_prob来补充
+            deficit_ratio = 1.0 - (obstacle / target_obstacle_steps) if target_obstacle_steps > 0 else 0
+            deficit_ratio = np.clip(deficit_ratio, 0.0, 1.0)
+
+            # 新的obstacle_free_prob = 旧的 * (1 - deficit_ratio)
+            # 这样当缺失多时，障碍物概率会上升
+            old_prob = self._scene_obstacle_free_prob.get(scene_key, 0.5)
+            new_prob = old_prob * (1.0 - deficit_ratio * 0.1)  # 每次最多调整10%
+            new_prob = np.clip(new_prob, 0.0, 0.9)  # 保持在合理范围
+
+            self._scene_obstacle_free_prob[scene_key] = new_prob
+
+            # 应用到environment
+            if hasattr(self.model.env, 'envs'):
+                for env in self.model.env.envs:
+                    if hasattr(env, 'obstacle_free_prob'):
+                        if scene_key == 'ws' and hasattr(env, 'ws_obstacle_free_prob'):
+                            env.ws_obstacle_free_prob = new_prob
+                        elif scene_key == 'gt':
+                            env.obstacle_free_prob = new_prob
+            elif hasattr(self.model.env, f'{scene_key}_obstacle_free_prob'):
+                setattr(self.model.env, f'{scene_key}_obstacle_free_prob', new_prob)
+
+            if deficit_ratio > 0.05 and self.verbose >= 1:
+                print(f"[障碍物平衡] {scene_key}: 缺失{deficit_ratio:.1%}, "
+                      f"obstacle_free_prob: {old_prob:.3f} → {new_prob:.3f}")
+
+
+# ============================================================
+# Step 预算补偿（基于步数统计的动态调整）
+# ============================================================
+class StepBudgetCompensationCallback(BaseCallback):
+    """
+    基于步数窗口统计，自动补偿学习机会不均衡。
+
+    工作原理：
+    1. 环境跟踪每个scene的"有障碍"与"无障碍"的步数
+    2. 每50个episode评估一次，检查是否达到目标障碍步数比例
+    3. 如果缺失，动态降低obstacle_free_prob来补充；如果过度，提高
+    """
+
+    def __init__(
+        self,
+        curriculum_phases: Dict[str, Dict[str, Any]],
+        window_episode_count: int = 50,
+        verbose: int = 1,
+    ):
+        super().__init__(verbose)
+        self.curriculum_phases = curriculum_phases
+        self.window_episode_count = window_episode_count
+
+        # 跟踪补偿历史（用于日志）
+        self.compensation_history = {}  # {scene_key: [(step, stats_dict), ...]}
+
+    def _on_step(self) -> bool:
+        """每一步检查是否需要评估和补偿"""
+
+        # 只在 DummyVecEnv 或 SubprocVecEnv 上工作
+        if not hasattr(self.model.env, 'envs'):
+            return True
+
+        # 获取当前阶段的配置
+        if not hasattr(self.model.env, '_curriculum_phase'):
+            return True
+
+        phase_name = self.model.env._curriculum_phase
+        phase_config = self.curriculum_phases.get(phase_name, {})
+
+        # 获取目标障碍比例
+        target_ratios = phase_config.get("obstacle_target_ratios", {})
+        if not target_ratios:
+            return True
+
+        # 检查所有环境是否有步数统计
+        for env in self.model.env.envs:
+            if not hasattr(env, '_step_budget_stats'):
+                continue
+
+            stats = env._step_budget_stats
+
+            # 检查每个scene是否达到评估窗口
+            for scene_key in ['ws', 'gt']:
+                if scene_key not in target_ratios or scene_key not in stats:
+                    continue
+
+                ep_count = stats[scene_key]['episode_count']
+                window_episodes = self.window_episode_count
+
+                # 检查是否达到评估点（但只在有足够数据时）
+                if ep_count > 0 and ep_count % window_episodes == 0 and ep_count % (window_episodes + 1) != 0:
+                    self._evaluate_and_compensate(env, scene_key, phase_config, target_ratios[scene_key])
+
+        return True
+
+    def _evaluate_and_compensate(
+        self,
+        env,
+        scene_key: str,
+        phase_config: Dict[str, Any],
+        target_ratio: float,
+    ) -> None:
+        """评估窗口内的步数分布，计算缺陷，调整障碍概率"""
+
+        stats = env._step_budget_stats[scene_key]
+        with_obs_steps = stats["window_with_obs_steps"]
+        without_obs_steps = stats["window_without_obs_steps"]
+        total_steps = with_obs_steps + without_obs_steps
+
+        if total_steps < 10:  # 数据太少，不调整
+            return
+
+        # 计算实际比例和缺陷
+        actual_ratio = with_obs_steps / total_steps if total_steps > 0 else 0
+        target_steps = int(total_steps * target_ratio)
+        deficit = target_steps - with_obs_steps  # 负数表示过度
+
+        # 只在缺陷显著时调整
+        if abs(deficit) < total_steps * 0.05:  # 缺陷 < 5% 不调整
+            return
+
+        # 获取当前的obstacle_free_prob
+        if scene_key == 'ws' and hasattr(env, 'ws_obstacle_free_prob'):
+            current_free_prob = env.ws_obstacle_free_prob or 0.5
+            is_ws = True
+        else:
+            current_free_prob = env.obstacle_free_prob
+            is_ws = False
+
+        max_compensation_ratio = phase_config.get("max_compensation_ratio", 0.25)
+
+        if deficit > 0:
+            # 缺少有障碍步数 → 降低 obstacle_free_prob
+            reduction = min(deficit / total_steps, max_compensation_ratio)
+            new_free_prob = max(0.0, current_free_prob - reduction)
+            direction = "↓"
+        else:
+            # 过度有障碍 → 提高 obstacle_free_prob
+            addition = min(-deficit / total_steps, max_compensation_ratio)
+            new_free_prob = min(1.0, current_free_prob + addition)
+            direction = "↑"
+
+        # 应用调整
+        if is_ws:
+            env.ws_obstacle_free_prob = new_free_prob
+        else:
+            env.obstacle_free_prob = new_free_prob
+
+        # 记录到历史
+        if scene_key not in self.compensation_history:
+            self.compensation_history[scene_key] = []
+
+        comp_record = {
+            "step": self.num_timesteps,
+            "episode_count": stats["episode_count"],
+            "with_obs_steps": with_obs_steps,
+            "without_obs_steps": without_obs_steps,
+            "target_ratio": target_ratio,
+            "actual_ratio": actual_ratio,
+            "deficit": deficit,
+            "old_free_prob": current_free_prob,
+            "new_free_prob": new_free_prob,
+        }
+        self.compensation_history[scene_key].append(comp_record)
+
+        # 打印日志
+        if self.verbose >= 1:
+            log_msg = (
+                f"\n📊 [Step预算补偿] {scene_key.upper()} @ 步{self.num_timesteps}\n"
+                f"   目标障碍率: {target_ratio:.0%} | 实际: {actual_ratio:.0%} | "
+                f"缺陷: {deficit:+d}步\n"
+                f"   obstacle_free_prob: {current_free_prob:.3f} {direction} {new_free_prob:.3f} "
+                f"(±{abs(new_free_prob - current_free_prob):.3f})"
+            )
+            print(log_msg)

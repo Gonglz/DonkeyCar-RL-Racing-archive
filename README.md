@@ -30,3 +30,4 @@ Notes:
 - This repo layout assumes `donkeycar` is available in the Python environment.
 - If you later want to sync models or datasets, use separate storage instead of
   checking large binaries into git by default.
+- V16 dual-domain obstacle curriculum details live in `docs/V16_CURRICULUM.md`.
