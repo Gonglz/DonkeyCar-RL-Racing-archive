@@ -22,6 +22,24 @@ from .control import (
     ActionSafetyWrapper, ThrottleControlWrapper, CurvatureAwareThrottleWrapper,
 )
 from .action_adapter import ActionAdapterWrapper
+from .world_model import (
+    NeuralPhysicsDynamics,
+    build_input_5d,
+    build_input_8d,
+    INPUT_DIM_BASELINE,
+    INPUT_DIM_FULL,
+    PHYS_DIM,
+    STATE_LO,
+    STATE_HI,
+)
+from .world_model_dataset import (
+    CatalogTransitionDataset,
+    CatalogTransitionDatasetV2,
+    SimTransitionDataset,
+    CombinedTransitionDataset,
+    chronological_split,
+)
+from .predictive_safety_filter import PredictiveSafetyFilter, PhysState
 from .robust_lane_detector import RobustLaneDetector, RobustYellowLaneEnhancer
 from .wrappers import (
     GeneralizationWrapper, TransposeWrapper, NormalizeWrapper,
