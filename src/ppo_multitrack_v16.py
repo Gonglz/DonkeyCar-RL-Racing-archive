@@ -1256,6 +1256,7 @@ def train_v16(
     auto_lr_cooldown_checks: int = 15,
     auto_lr_warmup_steps: int = 250000,
     auto_lr_best_window: int = 50,
+    sim2real_json: Optional[str] = None,
     extra_callbacks: Optional[List[BaseCallback]] = None,
     extra_run_metadata: Optional[Dict[str, Any]] = None,
     config_filename: str = "v16_config.json",
@@ -1620,6 +1621,7 @@ def train_v16(
             obstacle_seed=obstacle_seed,
             ego_random_spawn=ego_random_spawn,
             ego_spawn_lateral_ratio=ego_spawn_lateral_ratio,
+            sim2real_json=sim2real_json,
         )
 
     env = DummyVecEnv([make_env])
@@ -2119,6 +2121,10 @@ def main() -> None:
     parser.add_argument("--obstacle-seed", type=int, default=None)
     parser.add_argument("--ego-random-spawn", action="store_true", default=False)
     parser.add_argument("--ego-spawn-lateral-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--sim2real-json", type=str, default=None,
+        help="Path to dynamics_alignment_wm.json for sim2real throttle/steer scaling",
+    )
 
     args = parser.parse_args()
 
@@ -2177,6 +2183,7 @@ def main() -> None:
         obstacle_seed=args.obstacle_seed,
         ego_random_spawn=args.ego_random_spawn,
         ego_spawn_lateral_ratio=args.ego_spawn_lateral_ratio,
+        sim2real_json=args.sim2real_json,
         seed=args.seed,
         exp_tag=args.exp_tag,
         resume_latest=args.resume_latest,

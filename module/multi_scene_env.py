@@ -2331,8 +2331,10 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         ego_spawn_lateral_ratio: float = 0.5,
         ego_spawn_settle_steps: int = 3,
         ego_spawn_settle_sleep_s: float = 0.05,
+        sim2real_json: Optional[str] = None,
         **kwargs,
     ):
+        self.sim2real_json = str(sim2real_json) if sim2real_json else None
         self.track_dir = str(track_dir or "")
         self.obstacle_enabled = bool(obstacle_enabled)
         self.obstacle_scene_keys = tuple(
@@ -2578,6 +2580,9 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         )
 
         env = ScenarioObstacleWrapper(self._base_env, runtime=self._obstacle_runtime)
+        if getattr(self, "sim2real_json", None):
+            from .sim2real_wrapper import Sim2RealActionWrapper
+            env = Sim2RealActionWrapper.from_json(env, self.sim2real_json)
         env = CanonicalSemanticWrapper(
             env,
             domain=domain,
