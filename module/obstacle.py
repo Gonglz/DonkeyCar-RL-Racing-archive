@@ -73,8 +73,11 @@ _ENV_TO_SCENE_KEY: Dict[str, str] = {
 _UNITY_WORLD_SCALE = 8.0
 _DEFAULT_WORLD_Y = 0.5
 _DEFAULT_TRACK_PROFILE_DIR = MODULE_TRACK_DATA_DIR
+_FIXED_OBSTACLE_BODY_RGB: Tuple[int, int, int] = (255, 105, 180)
 _DEFAULT_OBSTACLE_BODY_RGBS: Tuple[Tuple[int, int, int], ...] = (
-    (0, 255, 0),
+    # Fixed from current real-camera sampling: pink separates best from
+    # blue boundary, orange/yellow center line, and white road surface.
+    _FIXED_OBSTACLE_BODY_RGB,
 )
 
 
@@ -623,7 +626,7 @@ class DonkeyObstacleCar:
         port: int = 9091,
         conf: Optional[Dict[str, Any]] = None,
         body_style: str = "donkey",
-        body_rgb: Tuple[int, int, int] = (255, 80, 80),
+        body_rgb: Tuple[int, int, int] = _FIXED_OBSTACLE_BODY_RGB,
         car_name: str = "obstacle_donkey",
         racer_name: str = "Obstacle",
         country: str = "CN",
