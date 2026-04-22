@@ -2098,7 +2098,8 @@ def main() -> None:
     parser.add_argument("--disable-obstacles", action="store_true", default=False)
     parser.add_argument("--obstacle-count", type=int, default=2)
     parser.add_argument("--obstacle-free-prob", type=float, default=0.15)
-    parser.add_argument("--obstacle-modes", nargs="+", default=["static", "jitter"])
+    # Keep this unset by default so curriculum phases can override obstacle modes.
+    parser.add_argument("--obstacle-modes", nargs="+", default=None)
     parser.add_argument("--obstacle-spawn-ahead-min-m", type=float, default=3.5)
     parser.add_argument("--obstacle-spawn-ahead-max-m", type=float, default=14.0)
     parser.add_argument("--obstacle-min-agent-planar-dist-m", type=float, default=1.5)
