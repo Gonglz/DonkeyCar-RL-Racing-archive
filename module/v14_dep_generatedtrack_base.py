@@ -7789,7 +7789,7 @@ def parse_args():
     p.add_argument('--lidar-max-range', type=float, default=50.0)
     p.add_argument('--lidar-noise', type=float, default=0.5)
     p.add_argument('--lidar-offset-x', type=float, default=0.0, help='LiDAR 左右偏移')
-    p.add_argument('--lidar-offset-y', type=float, default=1.14, help='LiDAR 高度（上下）')
+    p.add_argument('--lidar-offset-y', type=float, default=0.40, help='LiDAR 高度（上下）')
     p.add_argument('--lidar-offset-z', type=float, default=0.5, help='LiDAR 前后偏移')
     p.add_argument('--lidar-rot-x', type=float, default=0.0, help='LiDAR 俯仰角')
     p.add_argument('--npc-side-by-side-start', action='store_true', default=False,

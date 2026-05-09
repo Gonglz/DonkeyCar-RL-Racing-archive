@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-绿色车辆检测器 - Green Vehicle Detector (优化版)
+固定障碍车颜色检测器（兼容旧名 GreenVehicleDetector）
 
-检测仿真场景中的绿色小车，支持多种HSV参数方案对比与融合检测。
+当前障碍车固定颜色:
+  RGB = (255, 105, 180)
+  BGR = (180, 105, 255)
+
+历史接口名仍保留 `GreenVehicleDetector`，但内部逻辑已经改成
+围绕固定粉色障碍车做 HSV/RGB 融合检测。
 也可作为模块导入用于实时检测。
 
 用法:
@@ -18,12 +23,11 @@
     detector = GreenVehicleDetector(mode='simple')
     detections = detector.detect(img_bgr)
 
-更新日期: 2026-03-16
+更新日期: 2026-04-20
 改进内容:
-  - 改进的9种检测方法（添加饱和度过滤、面积约束等）
-  - 新增融合检测模式（基于4个干净方法的投票机制）
-  - 100%置信度的绿车检测（零误检）
-  - 支持简单和融合两种工作模式
+  - 默认对齐固定粉色障碍车 `(255, 105, 180)`
+  - 使用 HSV + RGB 联合约束，而不是单纯绿色阈值
+  - 继续支持简单和融合两种工作模式
 """
 
 import os
@@ -120,93 +124,201 @@ def _denoise_and_filter(
 
 
 # ---------------------------------------------------------------------------
-# 改进的9种检测方法（去除草地误检）
+# 固定粉色障碍车先验
+# ---------------------------------------------------------------------------
+_PINK_RGB = (255, 105, 180)
+_PINK_BGR = (180, 105, 255)
+_PINK_H_CV = 164  # rgb(255,105,180) -> hsv hue ≈ 164 in OpenCV 0..179
+
+
+def _pink_mask(
+    img: np.ndarray,
+    *,
+    h_lo: int,
+    h_hi: int,
+    s_lo: int,
+    v_lo: int,
+    r_lo: int,
+    b_lo: int,
+    rg_gap: int,
+    bg_gap: int,
+    roi_top_frac: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask_hsv = cv2.inRange(hsv, (h_lo, s_lo, v_lo), (h_hi, 255, 255))
+
+    b_ch = img[:, :, 0].astype(np.int16)
+    g_ch = img[:, :, 1].astype(np.int16)
+    r_ch = img[:, :, 2].astype(np.int16)
+    rgb_like = (
+        (r_ch >= int(r_lo))
+        & (b_ch >= int(b_lo))
+        & ((r_ch - g_ch) >= int(rg_gap))
+        & ((b_ch - g_ch) >= int(bg_gap))
+    ).astype(np.uint8) * 255
+
+    mask = cv2.bitwise_and(mask_hsv, rgb_like)
+    if roi_top_frac > 0.0:
+        roi_top = int(float(img.shape[0]) * float(roi_top_frac))
+        mask[:roi_top, :] = 0
+    return mask, hsv
+
+
+def raw_pink_prob(img: np.ndarray, roi_top_frac: float = 0.10) -> np.ndarray:
+    """
+    Loose fixed-pink probability channel for policy input.
+
+    This is intentionally less conservative than GreenVehicleDetector.detect()
+    so it preserves weak color evidence under lighting/color shift. Downstream
+    policy should treat it as an auxiliary cue, not as ground-truth detection.
+    """
+    if img is None:
+        return np.zeros((1, 1), dtype=np.float32)
+    img_bgr = np.asarray(img, dtype=np.uint8)
+    if img_bgr.ndim != 3 or img_bgr.shape[2] < 3:
+        return np.zeros(img_bgr.shape[:2] or (1, 1), dtype=np.float32)
+    img_bgr = img_bgr[:, :, :3]
+
+    loose, _ = _pink_mask(
+        img_bgr,
+        h_lo=138,
+        h_hi=179,
+        s_lo=25,
+        v_lo=38,
+        r_lo=70,
+        b_lo=45,
+        rg_gap=4,
+        bg_gap=-22,
+        roi_top_frac=roi_top_frac,
+    )
+    medium, _ = _pink_mask(
+        img_bgr,
+        h_lo=146,
+        h_hi=178,
+        s_lo=35,
+        v_lo=55,
+        r_lo=95,
+        b_lo=55,
+        rg_gap=10,
+        bg_gap=-8,
+        roi_top_frac=roi_top_frac,
+    )
+
+    prob = 0.55 * (loose.astype(np.float32) / 255.0) + 0.45 * (medium.astype(np.float32) / 255.0)
+    prob = cv2.morphologyEx(prob, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    prob = cv2.GaussianBlur(prob, (5, 5), sigmaX=1.2)
+    return np.clip(prob, 0.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 改进的9种检测方法（围绕固定粉色障碍车）
 # ---------------------------------------------------------------------------
 def detect_a_improved(img: np.ndarray) -> np.ndarray:
-    """A: H[35-85] S[80-255] + 增强过滤 (宽松但有饱和度过滤)"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (35, 80, 60), (85, 255, 255))
-    return _denoise_and_filter(mask, min_area=25, max_area=250,
-                              aspect_range=(0.3, 4.0),
-                              min_saturation=90, img_hsv=hsv)
+    """A: 宽松粉色 HSV + RGB 约束"""
+    mask, hsv = _pink_mask(
+        img, h_lo=146, h_hi=178, s_lo=35, v_lo=60,
+        r_lo=105, b_lo=60, rg_gap=10, bg_gap=-5,
+    )
+    return _denoise_and_filter(mask, min_area=20, max_area=280,
+                               aspect_range=(0.3, 4.2),
+                               min_saturation=45, img_hsv=hsv)
 
 
 def detect_b_improved(img: np.ndarray) -> np.ndarray:
-    """B: H[40-80] S[100-255] + 过滤 (中等严格度) ✓ CLEAN"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (40, 100, 80), (80, 255, 255))
-    return _denoise_and_filter(mask, min_area=30, max_area=250,
-                              aspect_range=(0.4, 3.5),
-                              min_saturation=100, img_hsv=hsv)
+    """B: 中等严格度粉色检测 ✓ CLEAN"""
+    mask, hsv = _pink_mask(
+        img, h_lo=150, h_hi=176, s_lo=55, v_lo=80,
+        r_lo=120, b_lo=70, rg_gap=18, bg_gap=0,
+    )
+    return _denoise_and_filter(mask, min_area=24, max_area=260,
+                               aspect_range=(0.35, 3.8),
+                               min_saturation=60, img_hsv=hsv)
 
 
 def detect_c_improved(img: np.ndarray) -> np.ndarray:
-    """C: H[45-75] S[120-255] + 过滤 (较严格) ✓ CLEAN"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (45, 120, 80), (75, 255, 255))
-    return _denoise_and_filter(mask, min_area=20, max_area=200,
-                              aspect_range=(0.4, 3.0),
-                              min_saturation=110, img_hsv=hsv)
+    """C: 更严格粉色检测"""
+    mask, hsv = _pink_mask(
+        img, h_lo=154, h_hi=174, s_lo=70, v_lo=90,
+        r_lo=135, b_lo=85, rg_gap=25, bg_gap=5,
+    )
+    return _denoise_and_filter(mask, min_area=18, max_area=220,
+                               aspect_range=(0.4, 3.2),
+                               min_saturation=75, img_hsv=hsv)
 
 
 def detect_d_improved(img: np.ndarray) -> np.ndarray:
-    """D: A + 形态学 + 增强过滤"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (35, 80, 60), (85, 255, 255))
-    return _denoise_and_filter(mask, min_area=25, max_area=250,
-                              aspect_range=(0.3, 4.0),
-                              min_saturation=85, img_hsv=hsv)
+    """D: A + 下半视野 ROI"""
+    mask, hsv = _pink_mask(
+        img, h_lo=146, h_hi=178, s_lo=40, v_lo=60,
+        r_lo=105, b_lo=60, rg_gap=10, bg_gap=-5,
+        roi_top_frac=0.20,
+    )
+    return _denoise_and_filter(mask, min_area=20, max_area=280,
+                               aspect_range=(0.3, 4.2),
+                               min_saturation=45, img_hsv=hsv)
 
 
 def detect_e_improved(img: np.ndarray) -> np.ndarray:
-    """E: B + 严格饱和度过滤 (S>115) ✓ CLEAN"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (40, 100, 80), (80, 255, 255))
-    return _denoise_and_filter(mask, min_area=30, max_area=250,
-                              aspect_range=(0.4, 3.5),
-                              min_saturation=115, img_hsv=hsv)
+    """E: B + 更严格饱和度 ✓ CLEAN"""
+    mask, hsv = _pink_mask(
+        img, h_lo=150, h_hi=176, s_lo=65, v_lo=80,
+        r_lo=120, b_lo=75, rg_gap=18, bg_gap=0,
+    )
+    return _denoise_and_filter(mask, min_area=24, max_area=260,
+                               aspect_range=(0.35, 3.8),
+                               min_saturation=70, img_hsv=hsv)
 
 
 def detect_f_improved(img: np.ndarray) -> np.ndarray:
-    """F: C + 极严格过滤"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (45, 120, 80), (75, 255, 255))
-    return _denoise_and_filter(mask, min_area=20, max_area=200,
-                              aspect_range=(0.4, 3.0),
-                              min_saturation=120, img_hsv=hsv)
+    """F: C + 极严格粉色过滤"""
+    mask, hsv = _pink_mask(
+        img, h_lo=156, h_hi=172, s_lo=85, v_lo=95,
+        r_lo=145, b_lo=95, rg_gap=30, bg_gap=8,
+    )
+    return _denoise_and_filter(mask, min_area=18, max_area=220,
+                               aspect_range=(0.4, 3.0),
+                               min_saturation=85, img_hsv=hsv)
 
 
 def detect_g_improved(img: np.ndarray) -> np.ndarray:
-    """G: A + ROI (下2/3) + 过滤"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (35, 80, 60), (85, 255, 255))
-    h_img = img.shape[0]
-    mask[:h_img//3, :] = 0  # 屏蔽上1/3
-    return _denoise_and_filter(mask, min_area=25, max_area=250,
-                              aspect_range=(0.3, 4.0),
-                              min_saturation=90, img_hsv=hsv)
+    """G: 宽松粉色 + 下2/3 ROI"""
+    mask, hsv = _pink_mask(
+        img, h_lo=146, h_hi=178, s_lo=40, v_lo=60,
+        r_lo=110, b_lo=65, rg_gap=12, bg_gap=-2,
+        roi_top_frac=0.33,
+    )
+    return _denoise_and_filter(mask, min_area=20, max_area=260,
+                               aspect_range=(0.3, 4.0),
+                               min_saturation=50, img_hsv=hsv)
 
 
 def detect_h_improved(img: np.ndarray) -> np.ndarray:
-    """H: H[38-82] S[110-255] V[70-200] + 过滤 ✓ CLEAN"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (38, 110, 70), (82, 255, 200))
-    return _denoise_and_filter(mask, min_area=25, max_area=250,
-                              aspect_range=(0.35, 3.5),
-                              min_saturation=105, img_hsv=hsv)
+    """H: 窄 hue 粉色检测 ✓ CLEAN"""
+    mask, hsv = _pink_mask(
+        img, h_lo=156, h_hi=172, s_lo=60, v_lo=70,
+        r_lo=120, b_lo=80, rg_gap=18, bg_gap=0,
+    )
+    return _denoise_and_filter(mask, min_area=22, max_area=240,
+                               aspect_range=(0.35, 3.5),
+                               min_saturation=65, img_hsv=hsv)
 
 
 def detect_i_improved(img: np.ndarray) -> np.ndarray:
-    """I: 双阈值 + 颜色纯度 + 过滤 ✓ CLEAN"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask_loose = cv2.inRange(hsv, (35, 70, 60), (90, 255, 255))
-    mask_strict = cv2.inRange(hsv, (42, 110, 80), (78, 255, 255))
+    """I: 双阈值种子生长式粉色检测 ✓ CLEAN"""
+    mask_loose, hsv = _pink_mask(
+        img, h_lo=146, h_hi=178, s_lo=35, v_lo=60,
+        r_lo=105, b_lo=60, rg_gap=10, bg_gap=-5,
+    )
+    mask_strict, _ = _pink_mask(
+        img, h_lo=156, h_hi=172, s_lo=80, v_lo=90,
+        r_lo=145, b_lo=90, rg_gap=28, bg_gap=5,
+    )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     seed = cv2.dilate(mask_strict, kernel, iterations=2)
     mask = cv2.bitwise_and(mask_loose, seed)
-    return _denoise_and_filter(mask, min_area=20, max_area=200,
-                              aspect_range=(0.4, 3.0),
-                              min_saturation=100, img_hsv=hsv)
+    return _denoise_and_filter(mask, min_area=18, max_area=220,
+                               aspect_range=(0.4, 3.2),
+                               min_saturation=55, img_hsv=hsv)
 
 
 # 所有方法列表
@@ -347,19 +459,73 @@ def _fuse_detections(all_objects_by_method: Dict, iou_threshold: float = 0.25) -
     return fused
 
 
+def _build_mask_from_detections(
+    source_mask: np.ndarray,
+    detections: List[VehicleDetection],
+) -> np.ndarray:
+    """Build a conservative mask only from accepted fused detections."""
+    if source_mask is None or len(detections) == 0:
+        return np.zeros_like(source_mask, dtype=np.uint8)
+
+    h_img, w_img = source_mask.shape[:2]
+    out = np.zeros_like(source_mask, dtype=np.uint8)
+    for det in detections:
+        x, y, w, h = det.bbox
+        x1 = int(np.clip(x, 0, max(w_img - 1, 0)))
+        y1 = int(np.clip(y, 0, max(h_img - 1, 0)))
+        x2 = int(np.clip(x + w, x1 + 1, w_img))
+        y2 = int(np.clip(y + h, y1 + 1, h_img))
+        roi = source_mask[y1:y2, x1:x2]
+        out[y1:y2, x1:x2] = cv2.bitwise_or(out[y1:y2, x1:x2], roi)
+    return out
+
+
+def _filter_fused_detections(
+    detections: List[VehicleDetection],
+    img_shape: Tuple[int, int],
+) -> List[VehicleDetection]:
+    """Reject weak fused detections that are likely edge/line artifacts."""
+    if not detections:
+        return []
+
+    h_img, w_img = img_shape[:2]
+    kept: List[VehicleDetection] = []
+    for det in detections:
+        x, y, w, h = det.bbox
+        bbox_area = max(w * h, 1)
+        fill_ratio = float(det.area / bbox_area)
+        aspect = float(max(w, h) / max(min(w, h), 1))
+        touches_border = bool(
+            x <= 1 or y <= 1 or (x + w) >= (w_img - 1) or (y + h) >= (h_img - 1)
+        )
+
+        min_votes = 3 if touches_border else 2
+        if det.votes < min_votes:
+            continue
+        if fill_ratio < 0.18 and det.votes < 4:
+            continue
+        if aspect > 5.0 and det.votes < 4:
+            continue
+        if det.area < 24 and det.votes < 4:
+            continue
+        kept.append(det)
+
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # GreenVehicleDetector - 主检测器类
 # ---------------------------------------------------------------------------
 class GreenVehicleDetector:
     """
-    绿色车辆检测器，支持融合检测和简单模式。
+    旧名保留的障碍车颜色检测器，支持融合检测和简单模式。
 
     参数
     ----
     mode : str
         'fused' - 使用4个干净方法的融合检测（推荐，高置信度）
         'simple' - 使用单一HSV阈值的简单检测（快速）
-    h_lo, h_hi : HSV色调范围（仅简单模式使用）
+    h_lo, h_hi : HSV色调范围（仅简单模式使用，默认围绕固定粉色）
     s_lo : 最低饱和度
     v_lo : 最低亮度
     min_area : 最小像素面积
@@ -369,11 +535,11 @@ class GreenVehicleDetector:
     def __init__(
         self,
         mode: str = 'fused',
-        h_lo: int = 40,
-        h_hi: int = 80,
-        s_lo: int = 100,
+        h_lo: int = 150,
+        h_hi: int = 176,
+        s_lo: int = 55,
         v_lo: int = 80,
-        min_area: int = 30,
+        min_area: int = 24,
         roi_top_frac: float = 0.15,
     ):
         self.mode = mode
@@ -385,20 +551,27 @@ class GreenVehicleDetector:
         self._kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
 
     def detect(self, img_bgr: np.ndarray) -> DetectionResult:
-        """对单帧BGR图像执行绿车检测"""
+        """对单帧BGR图像执行固定粉色障碍车检测"""
         if self.mode == 'fused':
             return self._detect_fused(img_bgr)
         else:
             return self._detect_simple(img_bgr)
 
     def _detect_simple(self, img_bgr: np.ndarray) -> DetectionResult:
-        """简单检测模式 - 单一HSV阈值"""
+        """简单检测模式 - 固定粉色 HSV + RGB 约束"""
         h_img = img_bgr.shape[0]
-        roi_top = int(h_img * self.roi_top_frac)
-
-        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.lower, self.upper)
-        mask[:roi_top, :] = 0
+        mask, _ = _pink_mask(
+            img_bgr,
+            h_lo=int(self.lower[0]),
+            h_hi=int(self.upper[0]),
+            s_lo=int(self.lower[1]),
+            v_lo=int(self.lower[2]),
+            r_lo=120,
+            b_lo=70,
+            rg_gap=18,
+            bg_gap=0,
+            roi_top_frac=self.roi_top_frac,
+        )
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel_close, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel_open, iterations=1)
@@ -442,8 +615,10 @@ class GreenVehicleDetector:
 
         # 融合检测结果
         detections = _fuse_detections(all_objects_by_method, iou_threshold=0.25)
+        detections = _filter_fused_detections(detections, img_bgr.shape[:2])
+        mask_final = _build_mask_from_detections(mask_combined, detections)
 
-        return DetectionResult(mask=mask_combined, detections=detections)
+        return DetectionResult(mask=mask_final, detections=detections)
 
     def visualize(
         self,

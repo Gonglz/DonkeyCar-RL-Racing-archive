@@ -156,6 +156,9 @@ class MultiSceneEnv(gym.Env):
         enable_step_balance_sampling: bool = True,
         step_balance_sampling_mix: float = 0.85,
         step_balance_mask: Optional[List[bool]] = None,
+        scene_reload_timeout_s: float = 25.0,
+        scene_reload_post_exit_sleep_s: float = 1.0,
+        scene_start_force_reload: bool = True,
         diff_mode: str = "dr_rgb",
         mask_mode: str = "lane",
         mask_scale: float = 1.0,
@@ -245,6 +248,9 @@ class MultiSceneEnv(gym.Env):
         self.dynamic_success_deficit_mix = float(np.clip(dynamic_success_deficit_mix, 0.0, 1.0))
         self.enable_step_balance_sampling = bool(enable_step_balance_sampling and len(env_ids) > 1)
         self.step_balance_sampling_mix = float(np.clip(step_balance_sampling_mix, 0.0, 1.0))
+        self.scene_reload_timeout_s = float(max(1.0, scene_reload_timeout_s))
+        self.scene_reload_post_exit_sleep_s = float(np.clip(scene_reload_post_exit_sleep_s, 0.0, 3.0))
+        self.scene_start_force_reload = bool(scene_start_force_reload)
         # step_balance_mask: True=主训练场景(参与步数缺口校正), False=预览/眉熟场景(不参与)
         if step_balance_mask is not None:
             if len(step_balance_mask) != len(env_ids):
@@ -304,6 +310,11 @@ class MultiSceneEnv(gym.Env):
             print(f"   最多连续步数: 禁用（仅按集数切换）")
         else:
             print(f"   最多连续步数: {self.max_steps_per_scene} 步/场景（超出后下次 reset 强制换场）")
+        print(
+            f"   场景切换: timeout={self.scene_reload_timeout_s:.1f}s, "
+            f"post_exit_sleep={self.scene_reload_post_exit_sleep_s:.2f}s, "
+            f"start_force_reload={int(self.scene_start_force_reload)}"
+        )
         if self.enable_dynamic_scene_weights:
             print(
                 f"   动态调权: 启用 (每{self.dynamic_weight_update_episodes}集更新, "
@@ -359,14 +370,23 @@ class MultiSceneEnv(gym.Env):
         return "unknown"
 
     @staticmethod
-    def _force_reload_scene(base_env, target_level_name: str, preflight: bool = False):
+    def _force_reload_scene(
+        base_env,
+        target_level_name: str,
+        preflight: bool = False,
+        timeout_s: float = 25.0,
+        post_exit_sleep_s: float = 1.0,
+    ):
         """场景切换公共逻辑——手动逆层找到 viewer、exit_scene、带超时等待加载。"""
         base = base_env
         while hasattr(base, "env"):
             base = base.env
 
-        def _wait_loaded_with_timeout(timeout_s: float = 25.0, poll_s: float = 0.2):
-            deadline = time.time() + timeout_s
+        timeout_s = float(max(1.0, timeout_s))
+        post_exit_sleep_s = float(np.clip(post_exit_sleep_s, 0.0, 3.0))
+
+        def _wait_loaded_with_timeout(wait_timeout_s: float, poll_s: float = 0.2):
+            deadline = time.time() + wait_timeout_s
             last_requery = 0.0
             last_progress_log = 0.0
             while time.time() < deadline:
@@ -392,9 +412,10 @@ class MultiSceneEnv(gym.Env):
         base.viewer.handler.SceneToLoad = target_level_name
         base.viewer.handler.loaded = False
         base.viewer.exit_scene()
-        time.sleep(1.0)
+        if post_exit_sleep_s > 0.0:
+            time.sleep(post_exit_sleep_s)
         base.viewer.handler.send_get_scene_names()
-        _wait_loaded_with_timeout(timeout_s=25.0)
+        _wait_loaded_with_timeout(wait_timeout_s=timeout_s)
         done_label = "训练前场景重载" if preflight else "场景切换"
         print(f"\u2705 {done_label}完成: {target_level_name}")
 
@@ -404,6 +425,11 @@ class MultiSceneEnv(gym.Env):
         Wrap gym.make with bounded retries so transient sim handshake failures
         do not immediately terminate training startup.
         """
+        sim_path = str(conf.get("exe_path", "") or "").strip()
+        if sim_path and sim_path not in ("remote", "none"):
+            # Local simulator startup is materially slower than remote attach.
+            retries = max(int(retries), 4)
+            retry_wait_s = max(float(retry_wait_s), 3.0)
         retries = int(max(1, retries))
         retry_wait_s = float(max(0.0, retry_wait_s))
         last_err: Optional[Exception] = None
@@ -921,8 +947,10 @@ class MultiSceneEnv(gym.Env):
         return env
 
     def reset(self, **kwargs):
+        weighted_scene_count = sum(1 for w in self.scene_weights if float(w) > 1e-9)
         step_budget_hit = (
             self.max_steps_per_scene is not None
+            and weighted_scene_count > 1
             and self._cur_scene_steps >= self.max_steps_per_scene
         )
 
@@ -1050,6 +1078,14 @@ class MultiInputObsWrapper(gym.Wrapper):
         snapshot_dir: Optional[str] = None,
         snapshot_max_steps: int = 0,
         snapshot_preview_tile: int = 160,
+        obstacle_context_source: str = "runtime",
+        obstacle_context_checkpoint: Optional[str] = None,
+        obstacle_context_device: str = "cpu",
+        obstacle_context_seq_len: int = 16,
+        obstacle_context_present_threshold: float = 0.5,
+        obstacle_context_present_off_threshold: Optional[float] = None,
+        obstacle_context_activation_consecutive: int = 3,
+        obstacle_context_deactivation_consecutive: int = 2,
     ):
         super().__init__(env)
         self.track_geometry = track_geometry
@@ -1074,6 +1110,25 @@ class MultiInputObsWrapper(gym.Wrapper):
         self.snapshot_dir = str(snapshot_dir or "").strip()
         self.snapshot_max_steps = int(max(0, snapshot_max_steps))
         self.snapshot_preview_tile = int(max(64, snapshot_preview_tile))
+        self.obstacle_context_source = str(obstacle_context_source or "runtime").strip().lower()
+        self.obstacle_context_checkpoint = str(obstacle_context_checkpoint or "").strip()
+        self.obstacle_context_device = str(obstacle_context_device or "cpu").strip()
+        self.obstacle_context_seq_len = int(max(1, obstacle_context_seq_len))
+        self.obstacle_context_present_threshold = float(
+            np.clip(obstacle_context_present_threshold, 0.01, 0.99)
+        )
+        self.obstacle_context_present_off_threshold = (
+            None
+            if obstacle_context_present_off_threshold is None
+            else float(np.clip(obstacle_context_present_off_threshold, 0.0, 0.99))
+        )
+        self.obstacle_context_activation_consecutive = int(
+            max(1, obstacle_context_activation_consecutive)
+        )
+        self.obstacle_context_deactivation_consecutive = int(
+            max(1, obstacle_context_deactivation_consecutive)
+        )
+        self._obstacle_context_estimator = None
 
         self._seg_model = None
         if self.vision_mode != "rgb" and self.seg_model_path:
@@ -1087,6 +1142,28 @@ class MultiInputObsWrapper(gym.Wrapper):
                 except Exception as e:
                     print(f"⚠️  seg model load failed: {type(e).__name__}: {e}, 回退到启发式分割。")
                     self._seg_model = None
+
+        if self.obstacle_context_source == "cv_v1":
+            from .obstacle_context import CVObstacleContextEstimatorV1
+
+            self._obstacle_context_estimator = CVObstacleContextEstimatorV1()
+        elif self.obstacle_context_source == "learned_v1":
+            from .obstacle_context import LearnedObstacleContextEstimatorV1
+
+            self._obstacle_context_estimator = LearnedObstacleContextEstimatorV1(
+                checkpoint_path=self.obstacle_context_checkpoint,
+                device=self.obstacle_context_device,
+                seq_len=self.obstacle_context_seq_len,
+                present_threshold=self.obstacle_context_present_threshold,
+                present_off_threshold=self.obstacle_context_present_off_threshold,
+                activation_consecutive=self.obstacle_context_activation_consecutive,
+                deactivation_consecutive=self.obstacle_context_deactivation_consecutive,
+            )
+        elif self.obstacle_context_source != "runtime":
+            raise ValueError(
+                f"invalid obstacle_context_source={self.obstacle_context_source}, "
+                "expected one of ('runtime','cv_v1','learned_v1')"
+            )
 
         self._last_info: Dict[str, Any] = {}
         self._prev_track_idx: Optional[int] = None
@@ -1136,6 +1213,11 @@ class MultiInputObsWrapper(gym.Wrapper):
             f"✅ MultiInputObsWrapper: mode={self.vision_mode}, "
             f"seg_model={'on' if self._seg_model is not None else 'heuristic'}"
         )
+        if self.obstacle_context_source != "runtime":
+            print(
+                f"   obstacle_context: source={self.obstacle_context_source}, "
+                f"device={self.obstacle_context_device or 'n/a'}"
+            )
         if self.snapshot_dir and self.snapshot_max_steps > 0:
             print(
                 f"   snapshot: save first {self.snapshot_max_steps} steps/scene -> {self.snapshot_dir}"
@@ -1436,15 +1518,39 @@ class MultiInputObsWrapper(gym.Wrapper):
         aligned = latent_raw - self.latent_align_weight * offset
         return np.clip(aligned, -3.0, 3.0).astype(np.float32)
 
+    def _apply_obstacle_context(self, img: np.ndarray, info: Dict[str, Any]) -> None:
+        info["obstacle_context_source"] = self.obstacle_context_source
+        if self.obstacle_context_source == "runtime" or self._obstacle_context_estimator is None:
+            return
+
+        info["obstacle_present_runtime"] = float(info.get("obstacle_present", 0.0) or 0.0)
+        info["obstacle_longitudinal_runtime"] = float(info.get("obstacle_longitudinal", 0.0) or 0.0)
+        info["obstacle_lateral_runtime"] = float(info.get("obstacle_lateral", 0.0) or 0.0)
+        info["obstacle_dist_runtime"] = float(info.get("obstacle_dist", 0.0) or 0.0)
+        info["obstacle_risk_runtime"] = float(info.get("obstacle_risk", 0.0) or 0.0)
+
+        state7 = _build_state_v13(
+            info,
+            self.action_safety_wrapper,
+            self.control_wrapper,
+            v_max=self.speed_vmax,
+        )
+        est = self._obstacle_context_estimator.estimate(img, info=info, state7=state7)
+        info.update(est.to_info_dict())
+        debug_prefix = "obstacle_cv" if self.obstacle_context_source == "cv_v1" else "obstacle_learned"
+        info.update(est.to_prefixed_debug_info(debug_prefix))
+
     def _obs_dict(self, img_obs: np.ndarray, info: Dict[str, Any]) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        img = np.asarray(img_obs, dtype=np.float32)
+        if img.shape != (self.image_channels, self.obs_size, self.obs_size):
+            raise ValueError(f"image obs shape mismatch: got {img.shape}, expected ({self.image_channels},{self.obs_size},{self.obs_size})")
+        self._apply_obstacle_context(img, info)
+
         if self._state_builder is not None:
             state = self._state_builder(info, self.action_safety_wrapper, self.control_wrapper)
             geo_log: Dict[str, float] = {}
         else:
             state, geo_log = self._build_state(info)
-        img = np.asarray(img_obs, dtype=np.float32)
-        if img.shape != (self.image_channels, self.obs_size, self.obs_size):
-            raise ValueError(f"image obs shape mismatch: got {img.shape}, expected ({self.image_channels},{self.obs_size},{self.obs_size})")
 
         obs_dict: Dict[str, np.ndarray] = {"image": img}
         if self.include_state_in_obs:
@@ -1471,6 +1577,8 @@ class MultiInputObsWrapper(gym.Wrapper):
             "car": (0.0, 0.0, 0.0), "pos": (0.0, 0.0, 0.0), "cte": 0.0,
         }
         self._prev_track_idx = None
+        if self._obstacle_context_estimator is not None:
+            self._obstacle_context_estimator.reset()
         obs, _ = self._obs_dict(img, self._last_info)
         return obs
 
@@ -1532,6 +1640,7 @@ class MultiInputObsWrapper(gym.Wrapper):
         info.setdefault("ep_r_smooth", 0.0)
         info.setdefault("ep_r_jerk", 0.0)
         info.setdefault("ep_r_mismatch", 0.0)
+        info.setdefault("ep_r_micro_wiggle", 0.0)
         info.setdefault("ep_r_sat", 0.0)
         info.setdefault("ep_r_total", 0.0)
         info.setdefault("ep_term_collision", 0.0)
@@ -1539,6 +1648,17 @@ class MultiInputObsWrapper(gym.Wrapper):
         info.setdefault("ep_term_offtrack", 0.0)
         info.setdefault("ep_term_env_done", 0.0)
         info.setdefault("ep_term_normal", 0.0)
+        info.setdefault("ep_lane_pid_debug_steps", 0.0)
+        info.setdefault("ep_lane_pid_target_speed_mean", 0.0)
+        info.setdefault("ep_lane_pid_speed_mean", 0.0)
+        info.setdefault("ep_lane_pid_speed_error_abs_mean", 0.0)
+        info.setdefault("ep_lane_pid_effective_lookahead_mean", 0.0)
+        info.setdefault("ep_lane_pid_local_forward_mean", 0.0)
+        info.setdefault("ep_lane_pid_local_left_abs_mean", 0.0)
+        info.setdefault("ep_lane_pid_lat_err_norm_abs_mean", 0.0)
+        info.setdefault("ep_lane_pid_steer_abs_mean", 0.0)
+        info.setdefault("ep_lane_pid_throttle_mean", 0.0)
+        info.setdefault("ep_lane_pid_reverse_rate", 0.0)
         info.setdefault("ep_cte_abs_p50", 0.0)
         info.setdefault("ep_cte_abs_p90", 0.0)
         info.setdefault("ep_cte_abs_p99", 0.0)
@@ -1803,6 +1923,9 @@ class MultiSceneEnvV12(MultiSceneEnv):
         enable_step_balance_sampling: bool = True,
         step_balance_sampling_mix: float = 0.85,
         step_balance_mask: Optional[List[bool]] = None,
+        scene_reload_timeout_s: float = 25.0,
+        scene_reload_post_exit_sleep_s: float = 1.0,
+        scene_start_force_reload: bool = True,
     ):
         # 注入 scene_specs，子类 _create_env 会用到
         MultiSceneEnvV12._SCENE_SPECS = scene_specs
@@ -1903,6 +2026,9 @@ class MultiSceneEnvV12(MultiSceneEnv):
             enable_step_balance_sampling=enable_step_balance_sampling,
             step_balance_sampling_mix=step_balance_sampling_mix,
             step_balance_mask=step_balance_mask,
+            scene_reload_timeout_s=scene_reload_timeout_s,
+            scene_reload_post_exit_sleep_s=scene_reload_post_exit_sleep_s,
+            scene_start_force_reload=scene_start_force_reload,
         )
 
     def _create_env(self, scene_idx: int):
@@ -2184,7 +2310,15 @@ class MultiSceneEnvV13(MultiSceneEnvV12):
             "near_offtrack_start_ratio", "w_near_offtrack",
             "w_near_collision", "near_collision_start_ratio",
             "overtake_success_bonus",
+            "safe_follow_bonus_scale",
+            "post_pass_stability_bonus",
+            "post_pass_stability_steps",
             "w_center", "w_heading",
+            "w_speed_ref", "speed_ref_vmin", "speed_ref_vmax", "speed_ref_kappa_ref",
+            "safe_follow_min_m", "safe_follow_max_m", "safe_follow_risk_max",
+            "safe_follow_speed_min", "safe_follow_ttc_min_s", "safe_follow_ttc_max_s",
+            "wait_window_bonus_scale", "wait_window_min_gap_m", "wait_window_max_gap_m",
+            "wait_window_max_closing_rate", "force_pass_penalty_scale",
             "collision_penalty_base", "offtrack_penalty_base",
             "survival_reward_scale", "progress_reward_scale",
             "lap_reward_scale",
@@ -2295,6 +2429,7 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         obstacle_enabled: bool = True,
         obstacle_scene_keys: Optional[List[str]] = None,
         obstacle_count: int = 2,
+        ws_obstacle_count: Optional[int] = None,
         obstacle_free_prob: float = 0.15,
         obstacle_modes: Optional[List[str]] = None,
         ws_obstacle_free_prob: Optional[float] = None,
@@ -2304,13 +2439,21 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         obstacle_min_agent_arc_dist_m: float = 3.5,
         obstacle_min_separation_world: float = 3.0,
         obstacle_lateral_choices: Optional[List[float]] = None,
+        ws_obstacle_lateral_choices: Optional[List[float]] = None,
         obstacle_fixed_progress_ratio: Optional[float] = None,
+        obstacle_fixed_progress_distribution: Optional[List[Tuple[float, float]]] = None,
+        obstacle_fixed_progress_gap: Optional[float] = None,
+        obstacle_fixed_progress_gap_min: Optional[float] = None,
+        obstacle_fixed_progress_gap_max: Optional[float] = None,
         obstacle_progress_min: Optional[float] = None,
         obstacle_progress_max: Optional[float] = None,
         obstacle_fixed_lateral_ratio: Optional[float] = None,
         gt_obstacle_start_exclusion_half_width_m: Optional[float] = None,
         ws_obstacle_modes: Optional[List[str]] = None,
         ws_obstacle_fixed_progress_ratio: Optional[float] = None,
+        ws_obstacle_fixed_progress_gap: Optional[float] = None,
+        ws_obstacle_fixed_progress_gap_min: Optional[float] = None,
+        ws_obstacle_fixed_progress_gap_max: Optional[float] = None,
         ws_obstacle_progress_min: Optional[float] = None,
         ws_obstacle_progress_max: Optional[float] = None,
         ws_obstacle_fixed_lateral_ratio: Optional[float] = None,
@@ -2331,8 +2474,36 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         ego_spawn_lateral_ratio: float = 0.5,
         ego_spawn_settle_steps: int = 3,
         ego_spawn_settle_sleep_s: float = 0.05,
+        sim2real_json: Optional[str] = None,
+        obstacle_context_source: str = "runtime",
+        obstacle_context_checkpoint: Optional[str] = None,
+        obstacle_context_device: str = "cpu",
+        obstacle_context_seq_len: int = 16,
+        obstacle_context_present_threshold: float = 0.5,
+        obstacle_context_present_off_threshold: Optional[float] = None,
+        obstacle_context_activation_consecutive: int = 3,
+        obstacle_context_deactivation_consecutive: int = 2,
         **kwargs,
     ):
+        self.sim2real_json = str(sim2real_json) if sim2real_json else None
+        self.obstacle_context_source = str(obstacle_context_source or "runtime").strip().lower()
+        self.obstacle_context_checkpoint = str(obstacle_context_checkpoint or "").strip()
+        self.obstacle_context_device = str(obstacle_context_device or "cpu").strip()
+        self.obstacle_context_seq_len = int(max(1, obstacle_context_seq_len))
+        self.obstacle_context_present_threshold = float(
+            np.clip(obstacle_context_present_threshold, 0.01, 0.99)
+        )
+        self.obstacle_context_present_off_threshold = (
+            None
+            if obstacle_context_present_off_threshold is None
+            else float(np.clip(obstacle_context_present_off_threshold, 0.0, 0.99))
+        )
+        self.obstacle_context_activation_consecutive = int(
+            max(1, obstacle_context_activation_consecutive)
+        )
+        self.obstacle_context_deactivation_consecutive = int(
+            max(1, obstacle_context_deactivation_consecutive)
+        )
         self.track_dir = str(track_dir or "")
         self.obstacle_enabled = bool(obstacle_enabled)
         self.obstacle_scene_keys = tuple(
@@ -2343,6 +2514,7 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             )
         )
         self.obstacle_count = int(max(1, obstacle_count))
+        self.ws_obstacle_count = None if ws_obstacle_count is None else int(max(1, ws_obstacle_count))
         self.obstacle_free_prob = float(np.clip(obstacle_free_prob, 0.0, 1.0))
         self.ws_obstacle_free_prob = (
             None
@@ -2363,11 +2535,46 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             float(np.clip(x, 0.0, 1.0))
             for x in (obstacle_lateral_choices if obstacle_lateral_choices is not None else [0.35, 0.5, 0.65])
         )
+        self.ws_obstacle_lateral_choices = (
+            None
+            if ws_obstacle_lateral_choices is None
+            else tuple(
+                float(np.clip(x, 0.0, 1.0))
+                for x in ws_obstacle_lateral_choices
+            )
+        )
         self.obstacle_fixed_progress_ratio = (
             None
             if obstacle_fixed_progress_ratio is None
             else float(np.clip(obstacle_fixed_progress_ratio, 0.0, 1.0))
         )
+        self.obstacle_fixed_progress_distribution = self._normalize_obstacle_progress_distribution(
+            obstacle_fixed_progress_distribution
+        )
+        self.obstacle_fixed_progress_gap = (
+            None
+            if obstacle_fixed_progress_gap is None
+            else float(np.clip(obstacle_fixed_progress_gap, 0.0, 1.0))
+        )
+        self.obstacle_fixed_progress_gap_min = (
+            None
+            if obstacle_fixed_progress_gap_min is None
+            else float(np.clip(obstacle_fixed_progress_gap_min, 0.0, 1.0))
+        )
+        self.obstacle_fixed_progress_gap_max = (
+            None
+            if obstacle_fixed_progress_gap_max is None
+            else float(np.clip(obstacle_fixed_progress_gap_max, 0.0, 1.0))
+        )
+        if (
+            self.obstacle_fixed_progress_gap_min is not None
+            and self.obstacle_fixed_progress_gap_max is not None
+            and self.obstacle_fixed_progress_gap_max < self.obstacle_fixed_progress_gap_min
+        ):
+            self.obstacle_fixed_progress_gap_min, self.obstacle_fixed_progress_gap_max = (
+                self.obstacle_fixed_progress_gap_max,
+                self.obstacle_fixed_progress_gap_min,
+            )
         self.obstacle_progress_min = (
             None
             if obstacle_progress_min is None
@@ -2411,6 +2618,30 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             if ws_obstacle_fixed_progress_ratio is None
             else float(np.clip(ws_obstacle_fixed_progress_ratio, 0.0, 1.0))
         )
+        self.ws_obstacle_fixed_progress_gap = (
+            None
+            if ws_obstacle_fixed_progress_gap is None
+            else float(np.clip(ws_obstacle_fixed_progress_gap, 0.0, 1.0))
+        )
+        self.ws_obstacle_fixed_progress_gap_min = (
+            None
+            if ws_obstacle_fixed_progress_gap_min is None
+            else float(np.clip(ws_obstacle_fixed_progress_gap_min, 0.0, 1.0))
+        )
+        self.ws_obstacle_fixed_progress_gap_max = (
+            None
+            if ws_obstacle_fixed_progress_gap_max is None
+            else float(np.clip(ws_obstacle_fixed_progress_gap_max, 0.0, 1.0))
+        )
+        if (
+            self.ws_obstacle_fixed_progress_gap_min is not None
+            and self.ws_obstacle_fixed_progress_gap_max is not None
+            and self.ws_obstacle_fixed_progress_gap_max < self.ws_obstacle_fixed_progress_gap_min
+        ):
+            self.ws_obstacle_fixed_progress_gap_min, self.ws_obstacle_fixed_progress_gap_max = (
+                self.ws_obstacle_fixed_progress_gap_max,
+                self.ws_obstacle_fixed_progress_gap_min,
+            )
         self.ws_obstacle_progress_min = (
             None
             if ws_obstacle_progress_min is None
@@ -2471,6 +2702,35 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         self._curriculum_phase = "warmup"  # 当前课程阶段，由train_v16更新
 
 
+    @staticmethod
+    def _normalize_obstacle_progress_distribution(
+        values: Optional[List[Tuple[float, float]]]
+    ) -> Optional[Tuple[Tuple[float, float], ...]]:
+        if values is None:
+            return None
+        normalized: List[Tuple[float, float]] = []
+        for item in values:
+            if item is None:
+                continue
+            if len(item) != 2:
+                raise ValueError(
+                    "obstacle_fixed_progress_distribution entries must be "
+                    "(probability, progress_ratio) pairs"
+                )
+            probability, progress_ratio = item
+            probability = float(np.clip(probability, 0.0, 1.0))
+            if probability <= 0.0:
+                continue
+            normalized.append((probability, float(np.clip(progress_ratio, 0.0, 1.0))))
+        total = sum(probability for probability, _progress_ratio in normalized)
+        if total > 1.0 + 1e-6:
+            raise ValueError(
+                "obstacle_fixed_progress_distribution probabilities must sum to <= 1.0, "
+                f"got {total:.6f}"
+            )
+        return tuple(normalized) or None
+
+
     def _build_obstacle_runtime_config(self):
         from .obstacle_runtime import ObstacleRuntimeConfig
 
@@ -2478,6 +2738,7 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             enabled=self.obstacle_enabled,
             active_scene_keys=self.obstacle_scene_keys,
             obstacle_count=self.obstacle_count,
+            ws_obstacle_count=self.ws_obstacle_count,
             obstacle_free_prob=self.obstacle_free_prob,
             obstacle_modes=self.obstacle_modes,
             ws_obstacle_free_prob=self.ws_obstacle_free_prob,
@@ -2487,13 +2748,21 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             min_agent_planar_dist_m=self.obstacle_min_agent_planar_dist_m,
             min_agent_arc_dist_m=self.obstacle_min_agent_arc_dist_m,
             lateral_choices=self.obstacle_lateral_choices,
+            ws_lateral_choices=self.ws_obstacle_lateral_choices,
             fixed_progress_ratio=self.obstacle_fixed_progress_ratio,
+            fixed_progress_distribution=self.obstacle_fixed_progress_distribution,
+            fixed_progress_gap_ratio=self.obstacle_fixed_progress_gap,
+            fixed_progress_gap_ratio_min=self.obstacle_fixed_progress_gap_min,
+            fixed_progress_gap_ratio_max=self.obstacle_fixed_progress_gap_max,
             obstacle_progress_min=self.obstacle_progress_min,
             obstacle_progress_max=self.obstacle_progress_max,
             fixed_lateral_ratio=self.obstacle_fixed_lateral_ratio,
             gt_obstacle_start_exclusion_half_width_m=self.gt_obstacle_start_exclusion_half_width_m,
             ws_obstacle_modes=self.ws_obstacle_modes,
             ws_obstacle_fixed_progress_ratio=self.ws_obstacle_fixed_progress_ratio,
+            ws_fixed_progress_gap_ratio=self.ws_obstacle_fixed_progress_gap,
+            ws_fixed_progress_gap_ratio_min=self.ws_obstacle_fixed_progress_gap_min,
+            ws_fixed_progress_gap_ratio_max=self.ws_obstacle_fixed_progress_gap_max,
             ws_obstacle_progress_min=self.ws_obstacle_progress_min,
             ws_obstacle_progress_max=self.ws_obstacle_progress_max,
             ws_obstacle_fixed_lateral_ratio=self.ws_obstacle_fixed_lateral_ratio,
@@ -2578,6 +2847,9 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
         )
 
         env = ScenarioObstacleWrapper(self._base_env, runtime=self._obstacle_runtime)
+        if getattr(self, "sim2real_json", None):
+            from .sim2real_wrapper import Sim2RealActionWrapper
+            env = Sim2RealActionWrapper.from_json(env, self.sim2real_json)
         env = CanonicalSemanticWrapper(
             env,
             domain=domain,
@@ -2639,7 +2911,15 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             "near_offtrack_start_ratio", "w_near_offtrack",
             "w_near_collision", "near_collision_start_ratio",
             "overtake_success_bonus",
+            "safe_follow_bonus_scale",
+            "post_pass_stability_bonus",
+            "post_pass_stability_steps",
             "w_center", "w_heading",
+            "w_speed_ref", "speed_ref_vmin", "speed_ref_vmax", "speed_ref_kappa_ref",
+            "safe_follow_min_m", "safe_follow_max_m", "safe_follow_risk_max",
+            "safe_follow_speed_min", "safe_follow_ttc_min_s", "safe_follow_ttc_max_s",
+            "wait_window_bonus_scale", "wait_window_min_gap_m", "wait_window_max_gap_m",
+            "wait_window_max_closing_rate", "force_pass_penalty_scale",
             "collision_penalty_base", "offtrack_penalty_base",
             "survival_reward_scale", "progress_reward_scale",
             "lap_reward_scale",
@@ -2711,6 +2991,14 @@ class MultiSceneEnvV16(MultiSceneEnvV13):
             state_dim=12,
             snapshot_dir=self.snapshot_dir,
             snapshot_max_steps=self.snapshot_max_steps,
+            obstacle_context_source=self.obstacle_context_source,
+            obstacle_context_checkpoint=self.obstacle_context_checkpoint,
+            obstacle_context_device=self.obstacle_context_device,
+            obstacle_context_seq_len=self.obstacle_context_seq_len,
+            obstacle_context_present_threshold=self.obstacle_context_present_threshold,
+            obstacle_context_present_off_threshold=self.obstacle_context_present_off_threshold,
+            obstacle_context_activation_consecutive=self.obstacle_context_activation_consecutive,
+            obstacle_context_deactivation_consecutive=self.obstacle_context_deactivation_consecutive,
         )
 
         env = Monitor(env, info_keywords=MONITOR_INFO_KEYS)

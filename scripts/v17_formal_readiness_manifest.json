@@ -1,0 +1,272 @@
+{
+  "manifest_id": "v17_formal_readiness_v1",
+  "launch_target": "formal_long_train",
+  "python_bin": "/home/longzhao/miniconda3/envs/donkey37/bin/python",
+  "sim_path": "remote",
+  "seed": 123,
+  "phase_a": {
+    "track_dir": "track_profiles",
+    "track_search_dirs": [
+      "track_profiles",
+      "module/track_data"
+    ],
+    "track_files": {
+      "donkey-generated-track-v0": "manual_width_generated_track.json",
+      "donkey-waveshare-v0": "manual_width_waveshare.json"
+    },
+    "env_ids": [
+      "donkey-generated-track-v0",
+      "donkey-waveshare-v0"
+    ],
+    "obs_size": 128,
+    "lidar_obs_mode": "full",
+    "sim_probe_host": "127.0.0.1",
+    "sim_probe_port": 9091,
+    "sim_probe_timeout_s": 1.0,
+    "lidar_num_sectors": 36,
+    "lidar_fov_deg": 180.0,
+    "lidar_max_range_m": 20.0,
+    "lidar_near_clip_m": 0.18,
+    "required_scripts": [
+      "src/ppo_multitrack_v17.py",
+      "scripts/export_world_model_dataset.py",
+      "scripts/train_world_model_v17.py",
+      "scripts/collect_sim_lidar_monitor.py",
+      "scripts/eval_lidar_domain_gap.py",
+      "scripts/eval_world_model_readiness.py",
+      "scripts/run_v17_formal_readiness.py"
+    ],
+    "required_paths": {
+      "sim_launcher_script": "/home/longzhao/bin/start_donkey_vnc.sh",
+      "gt_policy_path": "models/v16_pid_overtake_course_20260420/best_model_gt.zip",
+      "ws_policy_path": "models/v16_pid_overtake_course_20260420/best_model_ws.zip"
+    },
+    "real_lidar_paths": [
+      "/home/longzhao/mysim/data/data_lidar/0421/monitor_logs/run_20260421_005659_lidar_raw.jsonl",
+      "/home/longzhao/mysim/data/data_lidar/0422_1/monitor_logs/run_20260422_165617_lidar_raw.jsonl"
+    ]
+  },
+  "phase_b": {
+    "save_dir": "phase_b_ppo_smoke",
+    "env_ids": [
+      "donkey-generated-track-v0"
+    ],
+    "scene_weights": [
+      1.0
+    ],
+    "steps": 256,
+    "port": 9091,
+    "obs_size": 128,
+    "ppo_n_steps": 256,
+    "ppo_batch_size": 64,
+    "ppo_n_epochs": 4,
+    "learning_rate": 8e-05,
+    "ent_coef": 0.01,
+    "target_kl": 0.01,
+    "file_metrics_log_freq": 50,
+    "exp_tag": "v17_formal_readiness_smoke"
+  },
+  "phase_c": {
+    "base_port": 9102,
+    "sim_start_delay": 10.0,
+    "obs_size": 128,
+    "lidar_num_sectors": 36,
+    "lidar_max_range_m": 20.0,
+    "sim2real_json": "/home/longzhao/mysim_public/models/sim2real_phasef_20260424/phase_f_motion_fit_v5_midpoint_tuned.json",
+    "passable_gap_threshold_m": 1.4,
+    "exports": [
+      {
+        "name": "gt_main",
+        "sim": "remote",
+        "port": 9091,
+        "env_ids": [
+          "donkey-generated-track-v0"
+        ],
+        "scene_weights": [
+          1.0
+        ],
+        "policy_path": "models/v16_pid_overtake_course_20260420/best_model_gt.zip",
+        "policy_format": "v16",
+        "samples": 3072,
+        "curriculum_phase": "lane_pid_full",
+        "output": "phase_c_dataset/gt_lane_pid_full_v16gt_main.npz"
+      },
+      {
+        "name": "gt_pilot",
+        "sim": "remote",
+        "port": 9091,
+        "env_ids": [
+          "donkey-generated-track-v0"
+        ],
+        "scene_weights": [
+          1.0
+        ],
+        "policy_path": "models/v16_pid_overtake_course_20260420/best_model_gt.zip",
+        "policy_format": "v16",
+        "samples": 1024,
+        "curriculum_phase": "lane_pid_full",
+        "output": "phase_c_dataset/pilot_gt_lane_pid_full_v16gt_collisionfix.npz"
+      },
+      {
+        "name": "ws_pilot",
+        "sim": "remote",
+        "port": 9091,
+        "env_ids": [
+          "donkey-waveshare-v0"
+        ],
+        "scene_weights": [
+          1.0
+        ],
+        "policy_path": "models/v16_pid_overtake_course_20260420/best_model_ws.zip",
+        "policy_format": "v16",
+        "samples": 1024,
+        "curriculum_phase": "lane_pid_full",
+        "output": "phase_c_dataset/pilot_ws_lane_pid_full_v16ws_collisionfix.npz"
+      }
+    ],
+    "merged_output_npz": "phase_c_dataset/wm_dataset_mix_v1.npz",
+    "merged_output_json": "phase_c_dataset/wm_dataset_mix_v1.json",
+    "thresholds": {
+      "expected_samples": 5120,
+      "expected_scenes": [
+        "generated_track",
+        "waveshare"
+      ],
+      "collision_pos_rate_min": 0.05,
+      "collision_pos_rate_max": 0.3,
+      "opportunity_valid_rate_min": 0.7,
+      "passable_rate_min": 0.1,
+      "passable_rate_max": 0.9
+    }
+  },
+  "phase_d": {
+    "save_dir": "phase_d_world_model_train",
+    "device": "auto",
+    "seq_len": 4,
+    "val_ratio": 0.15,
+    "batch_size": 256,
+    "hidden_dim": 128,
+    "epochs_a": 8,
+    "epochs_b": 6,
+    "epochs_c": 3,
+    "lr_a": 0.001,
+    "lr_b": 0.0005,
+    "lr_c": 0.0001,
+    "thresholds": {
+      "stage_a_mae_target_rel_max": 2.5,
+      "stage_a_mae_gap_max": 2.0,
+      "stage_b_geom_regression_max_ratio": 0.05,
+      "stage_c_guard_geom_regression_max_ratio": 0.03
+    }
+  },
+  "phase_f": {
+    "sim_start_delay": 10.0,
+    "motion_precheck_frames": 200,
+    "pose_sweep_precheck_frames": 200,
+    "pose_sweep_top_k": 3,
+    "collect": {
+      "env_id": "donkey-waveshare-v0",
+      "policy_path": "models/v16_pid_overtake_course_20260420/best_model_ws.zip",
+      "policy_format": "v16",
+      "curriculum_phase": "warmup",
+      "sim_start_delay": 10.0,
+      "frames": 1200,
+      "max_episode_steps": 640,
+      "port": 9091,
+      "obs_size": 128,
+      "lidar_num_sectors": 36,
+      "lidar_max_range_m": 20.0,
+      "lidar_near_clip_m": 0.18,
+      "lidar_deg_per_sweep_inc": 1.0,
+      "lidar_deg_ang_down": 0.0,
+      "lidar_deg_ang_delta": -1.0,
+      "lidar_num_sweeps_levels": 1,
+      "lidar_noise": 0.0,
+      "lidar_offset_x": 0.0,
+      "lidar_offset_y": 0.4,
+      "lidar_offset_z": 0.5,
+      "lidar_rot_x": 0.0,
+      "sim2real_json": "/home/longzhao/mysim_public/models/sim2real_phasef_20260424/phase_f_motion_fit_v5_midpoint_tuned.json"
+    },
+    "driver_profile_candidates": [
+      "models/v16_pid_overtake_course_20260420/best_model_ws.zip"
+    ],
+    "pose_sweep": {
+      "offset_y": [
+        0.35,
+        0.4,
+        0.45
+      ],
+      "offset_z": [
+        0.45,
+        0.5,
+        0.55
+      ],
+      "rot_x": [
+        -2.0,
+        0.0,
+        2.0
+      ],
+      "lidar_noise": [
+        0.0,
+        0.02
+      ],
+      "near_clip": [
+        0.18,
+        0.22
+      ]
+    },
+    "eval": {
+      "real_paths_primary": [
+        "/home/longzhao/mysim/data/data_lidar/0421/monitor_logs/run_20260421_005659_lidar_raw.jsonl"
+      ],
+      "real_paths_stress": [
+        "/home/longzhao/mysim/data/data_lidar/0422_1/monitor_logs/run_20260422_165617_lidar_raw.jsonl"
+      ],
+      "real_motion_csv_primary": "/home/longzhao/mysim/data/data_lidar/0421/monitor_logs/run_20260421_005659.csv",
+      "num_sectors": 36,
+      "fov_deg": 180.0,
+      "compare_max_range_m": 12.0,
+      "near_clip_m": 0.18,
+      "range_bands": [
+        "0,5",
+        "5,max"
+      ],
+      "js_bins": 24,
+      "output_json_primary": "phase_f_deployment/lidar_domain_gap_eval_primary.json",
+      "output_json_stress": "phase_f_deployment/lidar_domain_gap_eval_stress.json",
+      "legacy_thresholds": {
+        "valid_ratio_mae_max": 0.1,
+        "wasserstein_median_max": 0.08,
+        "wasserstein_p95_max": 0.2,
+        "scene_js_divergence_max": 0.15
+      },
+      "thresholds": {
+        "range_0_5m": {
+          "valid_ratio_mae_max": 0.1,
+          "wasserstein_median_max": 0.08,
+          "wasserstein_p95_max": 0.2
+        },
+        "overall_0_12m": {
+          "scene_js_divergence_max": 0.15
+        },
+        "motion": {
+          "speed_ratio_min": 0.8,
+          "speed_ratio_max": 1.25,
+          "abs_final_angle_p95_gap_max": 0.1
+        },
+        "motion_enough": {
+          "speed_ratio_min": 0.5,
+          "speed_ratio_max": 2.5,
+          "abs_final_angle_p95_gap_max": 0.2
+        },
+        "deployment_feature_alignment": {
+          "front_min_p50_abs_diff_max": 1.0,
+          "left_gap_p50_abs_diff_max": 1.0,
+          "right_gap_p50_abs_diff_max": 1.0,
+          "valid_ratio_mean_abs_diff_max": 0.5
+        }
+      }
+    }
+  }
+}

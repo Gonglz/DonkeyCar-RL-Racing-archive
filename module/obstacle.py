@@ -16,6 +16,7 @@ module/obstacle.py
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import sys
@@ -73,8 +74,10 @@ _ENV_TO_SCENE_KEY: Dict[str, str] = {
 _UNITY_WORLD_SCALE = 8.0
 _DEFAULT_WORLD_Y = 0.5
 _DEFAULT_TRACK_PROFILE_DIR = MODULE_TRACK_DATA_DIR
+# Fixed obstacle color aligned to the real obstacle-car appearance.
+_FIXED_OBSTACLE_BODY_RGB: Tuple[int, int, int] = (255, 105, 180)
 _DEFAULT_OBSTACLE_BODY_RGBS: Tuple[Tuple[int, int, int], ...] = (
-    (0, 255, 0),
+    _FIXED_OBSTACLE_BODY_RGB,
 )
 
 
@@ -226,6 +229,38 @@ class LanePIDConfig:
     max_throttle: float = 0.32
     min_throttle: float = 0.06
     throttle_steer_damp: float = 0.35
+
+
+@dataclass
+class LanePIDDebugState:
+    active: float = 0.0
+    target_speed: float = 0.0
+    speed: float = 0.0
+    speed_error: float = 0.0
+    effective_lookahead: float = 0.0
+    local_forward: float = 0.0
+    local_left: float = 0.0
+    lookahead_distance: float = 0.0
+    lat_err_norm: float = 0.0
+    steer: float = 0.0
+    throttle: float = 0.0
+    reverse_mode: float = 0.0
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "active": float(self.active),
+            "target_speed": float(self.target_speed),
+            "speed": float(self.speed),
+            "speed_error": float(self.speed_error),
+            "effective_lookahead": float(self.effective_lookahead),
+            "local_forward": float(self.local_forward),
+            "local_left": float(self.local_left),
+            "lookahead_distance": float(self.lookahead_distance),
+            "lat_err_norm": float(self.lat_err_norm),
+            "steer": float(self.steer),
+            "throttle": float(self.throttle),
+            "reverse_mode": float(self.reverse_mode),
+        }
 
 
 @dataclass
@@ -533,13 +568,14 @@ def sample_track_target(
         raise KeyError("Unknown scene_key for obstacle target: %s" % scene_key)
 
     g = track_geometry.scenes[scene_key]
-    idx, _t, _center, left, right, width = _segment_pose_at_progress(g, progress_ratio)
+    idx, _t, center, left, right, width = _segment_pose_at_progress(g, progress_ratio)
 
     usable_margin = float(max(obstacle_radius + safety_margin, 0.0))
     margin_ratio = float(np.clip(usable_margin / max(width, 1e-6), 0.0, 0.49))
     lateral = float(np.clip(lateral_ratio, margin_ratio, 1.0 - margin_ratio))
 
     point = (1.0 - lateral) * right + lateral * left
+
     tangent = g.tangent[idx]
     track_heading_deg = float(math.degrees(math.atan2(float(tangent[1]), float(tangent[0]))))
     yaw_deg = track_heading_deg_to_telemetry_yaw_deg(track_heading_deg)
@@ -623,7 +659,7 @@ class DonkeyObstacleCar:
         port: int = 9091,
         conf: Optional[Dict[str, Any]] = None,
         body_style: str = "donkey",
-        body_rgb: Tuple[int, int, int] = (255, 80, 80),
+        body_rgb: Tuple[int, int, int] = _FIXED_OBSTACLE_BODY_RGB,
         car_name: str = "obstacle_donkey",
         racer_name: str = "Obstacle",
         country: str = "CN",
@@ -673,7 +709,7 @@ class DonkeyObstacleCar:
                 "body_style": body_style,
                 "body_rgb": tuple(int(v) for v in body_rgb),
                 "car_name": str(car_name),
-                "font_size": int(self.conf.get("font_size", 60)),
+                "font_size": max(80, int(self.conf.get("font_size", 60))),
                 "racer_name": str(racer_name),
                 "country": str(country),
                 "bio": str(bio),
@@ -694,7 +730,9 @@ class DonkeyObstacleCar:
         self._reset_evt = threading.Event()
         self._lock = threading.Lock()
         self._last_info: Dict[str, Any] = {}
+        self._last_info_t: float = 0.0
         self._last_error: Optional[str] = None
+        self._last_set_position_msg: Optional[Dict[str, Any]] = None
         self._target: Optional[TrackTarget] = None
         self._manual_action = np.zeros((2,), dtype=np.float32)
         self._use_autopilot = False
@@ -703,11 +741,13 @@ class DonkeyObstacleCar:
         self._agent_info: Optional[Dict[str, Any]] = None
         self._node_position_evt = threading.Event()
         self._node_position_resp: Optional[Dict[str, Any]] = None
+        self._reset_reason: str = ""
         self._jitter_cfg: Optional[PositionJitterConfig] = None
         self._jitter_next_update_t: float = 0.0
         self._nudge_cfg: Optional[InPlaceNudgeConfig] = None
         self._nudge_next_update_t: float = 0.0
         self._lane_pid_cfg: Optional[LanePIDConfig] = None
+        self._lane_pid_debug = LanePIDDebugState()
         self._lane_speed_pid = _PIDController(
             output_limits=(0.0, 1.0),
             integral_limit=3.0,
@@ -716,6 +756,9 @@ class DonkeyObstacleCar:
             output_limits=(-1.0, 1.0),
             integral_limit=2.0,
         )
+        self._debug_event_seq = 0
+        self._last_debug_error_sig: Optional[str] = None
+        self._last_debug_error_t = 0.0
 
     @staticmethod
     def _import_sim_env():
@@ -766,8 +809,12 @@ class DonkeyObstacleCar:
             )
         self._stop_evt.clear()
         if reset_on_spawn:
+            with self._lock:
+                self._reset_reason = "spawn_reset_on_spawn"
             self._reset_evt.set()
         else:
+            with self._lock:
+                self._reset_reason = ""
             self._reset_evt.clear()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -789,9 +836,22 @@ class DonkeyObstacleCar:
                 pass
         self._env = None
 
-    def reset(self) -> None:
+    def reset(self, reason: str = "manual") -> None:
         """请求障碍车 reset 到该 client 的默认出生点。"""
+        with self._lock:
+            self._reset_reason = str(reason)
+        self._log_debug_event("reset_requested", reason=str(reason))
         self._reset_evt.set()
+
+    def reset_and_wait(self, reason: str = "manual", timeout_s: float = 1.0) -> bool:
+        """请求 reset，并等待后台 client 完成一次 env.reset。"""
+        self.reset(reason=reason)
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while time.time() < deadline:
+            if not self._reset_evt.is_set():
+                return True
+            time.sleep(0.02)
+        return not self._reset_evt.is_set()
 
     def set_manual_action(self, steering: float = 0.0, throttle: float = 0.0) -> None:
         with self._lock:
@@ -830,6 +890,10 @@ class DonkeyObstacleCar:
             if self._hold_brake and np.allclose(self._manual_action, 0.0):
                 return "hold"
             return "manual"
+
+    def get_lane_pid_debug(self) -> Dict[str, float]:
+        with self._lock:
+            return self._lane_pid_debug.as_dict()
 
     def start_position_jitter(
         self,
@@ -987,6 +1051,11 @@ class DonkeyObstacleCar:
                 min_throttle=float(_clip_float(min_throttle, 0.0, max(max_throttle, 0.0))),
                 throttle_steer_damp=float(_clip_float(throttle_steer_damp, 0.0, 0.95)),
             )
+            self._lane_pid_debug = LanePIDDebugState(
+                active=0.0,
+                target_speed=float(max(target_speed, 0.0)),
+                effective_lookahead=float(max(lookahead_m, 0.1)),
+            )
             self._manual_action = np.zeros((2,), dtype=np.float32)
             self._use_autopilot = False
             self._hold_brake = False
@@ -1008,6 +1077,36 @@ class DonkeyObstacleCar:
             world_y=world_y,
             hold_brake=hold_brake,
         )
+
+    def place_explicit_target(
+        self,
+        target: TrackTarget,
+        hold_brake: bool = True,
+        timeout_s: Optional[float] = None,
+    ) -> TrackTarget:
+        """直接使用已采样好的目标点放置，避免再次按 progress/lateral 重采样。"""
+        with self._lock:
+            self._clear_dynamic_modes_locked()
+            self._target = target
+        if self._handler() is not None:
+            try:
+                placed = self.place_pose(
+                    x=target.x,
+                    z=target.z,
+                    yaw_deg=target.yaw_deg,
+                    world_y=self.default_world_y,
+                    hold_brake=hold_brake,
+                    timeout_s=timeout_s,
+                )
+                if placed is not None:
+                    return target
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = "%s: %s" % (type(exc).__name__, exc)
+        with self._lock:
+            self._use_autopilot = True
+            self._hold_brake = False
+        return target
 
     def set_track_target(
         self,
@@ -1045,7 +1144,7 @@ class DonkeyObstacleCar:
                     x=target.x,
                     z=target.z,
                     yaw_deg=target.yaw_deg,
-                    world_y=None,
+                    world_y=self.default_world_y,
                     hold_brake=hold_brake,
                     timeout_s=timeout_s,
                 )
@@ -1102,19 +1201,51 @@ class DonkeyObstacleCar:
         if handler is None:
             raise RuntimeError("Obstacle client is not spawned")
 
-        self._teleport_raw(
-            x=float(x),
-            z=float(z),
-            yaw_deg=float(yaw_deg),
-            world_y=world_y,
-            hold_brake=hold_brake,
+        request = {
+            "x": round(float(x), 3),
+            "z": round(float(z), 3),
+            "yaw": round(float(yaw_deg), 1),
+            "world_y": None if world_y is None else round(float(world_y), 3),
+            "hold_brake": bool(hold_brake),
+            "timeout_s": None if timeout_s is None else round(float(timeout_s), 3),
+        }
+        self._log_debug_event("place_pose_start", request=request)
+        try:
+            self._teleport_raw(
+                x=float(x),
+                z=float(z),
+                yaw_deg=float(yaw_deg),
+                world_y=world_y,
+                hold_brake=hold_brake,
+            )
+            pose = self._wait_for_pose(
+                x=x,
+                z=z,
+                yaw_deg=yaw_deg,
+                timeout_s=self.placement_timeout_s if timeout_s is None else timeout_s,
+            )
+        except Exception as exc:
+            self._log_debug_event(
+                "place_pose_error",
+                request=request,
+                error="%s: %s" % (type(exc).__name__, exc),
+            )
+            raise
+
+        pos_err = None
+        yaw_err = None
+        if pose is not None:
+            pos_err = math.hypot(float(pose.x - x), float(pose.z - z))
+            yaw_err = abs(math.degrees(_wrap_pi(math.radians(float(pose.yaw_deg - yaw_deg)))))
+        self._log_debug_event(
+            "place_pose_result",
+            request=request,
+            observed=self._pose_debug_payload(pose),
+            pos_err=None if pos_err is None else round(float(pos_err), 3),
+            yaw_err=None if yaw_err is None else round(float(yaw_err), 1),
+            ok=bool(pos_err is not None and pos_err <= 0.10 and yaw_err is not None and yaw_err <= 10.0),
         )
-        return self._wait_for_pose(
-            x=x,
-            z=z,
-            yaw_deg=yaw_deg,
-            timeout_s=self.placement_timeout_s if timeout_s is None else timeout_s,
-        )
+        return pose
 
     def query_node_position(self, index: int, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         """查询 Unity car path 节点坐标，同时返回 world 坐标和 telemetry 坐标。"""
@@ -1160,6 +1291,7 @@ class DonkeyObstacleCar:
         self._jitter_cfg = None
         self._jitter_next_update_t = 0.0
         self._lane_pid_cfg = None
+        self._lane_pid_debug = LanePIDDebugState()
         self._lane_speed_pid.reset()
         self._lane_steer_pid.reset()
 
@@ -1302,6 +1434,106 @@ class DonkeyObstacleCar:
         with self._lock:
             return self._last_error
 
+    @staticmethod
+    def _pose_debug_payload(pose: Optional[PoseState]) -> Optional[Dict[str, Any]]:
+        if pose is None:
+            return None
+        return {
+            "x": round(float(pose.x), 3),
+            "y": round(float(pose.y), 3),
+            "z": round(float(pose.z), 3),
+            "yaw": round(float(pose.yaw_deg), 1),
+            "speed": round(float(pose.speed), 3),
+            "cte": round(float(pose.cte), 3),
+            "hit": str(pose.hit),
+            "progress": None if pose.progress_ratio is None else round(float(pose.progress_ratio), 4),
+        }
+
+    def _motion_mode_debug_locked(self) -> str:
+        if self._nudge_cfg is not None:
+            return "nudge"
+        if self._jitter_cfg is not None:
+            return "jitter"
+        if self._lane_pid_cfg is not None:
+            return "lane_pid"
+        if self._use_autopilot:
+            return "track_target"
+        if self._hold_brake and np.allclose(self._manual_action, 0.0):
+            return "hold"
+        return "manual"
+
+    def _log_debug_event(self, event: str, **fields: Any) -> None:
+        try:
+            with self._lock:
+                self._debug_event_seq += 1
+                seq = int(self._debug_event_seq)
+                last_info_t = float(self._last_info_t)
+                last_error = self._last_error
+                motion_mode = self._motion_mode_debug_locked()
+                target = self._target
+                thread_alive = bool(self._thread is not None and self._thread.is_alive())
+            payload: Dict[str, Any] = {
+                "event": str(event),
+                "seq": seq,
+                "t": round(float(time.time()), 3),
+                "car_name": str(self.conf.get("car_name", "")),
+                "racer_name": str(self.conf.get("racer_name", "")),
+                "guid": str(self.conf.get("guid", "")),
+                "scene_key": self.scene_key,
+                "host": self.host,
+                "port": int(self.port),
+                "motion_mode": motion_mode,
+                "thread_alive": thread_alive,
+                "handler_ready": self._handler() is not None,
+                "last_info_age_s": None if last_info_t <= 0.0 else round(float(max(0.0, time.time() - last_info_t)), 3),
+                "last_error": last_error,
+                "target": None if target is None else {
+                    "progress": round(float(target.progress_ratio), 4),
+                    "lateral": round(float(target.lateral_ratio), 3),
+                    "x": round(float(target.x), 3),
+                    "z": round(float(target.z), 3),
+                    "yaw": round(float(target.yaw_deg), 1),
+                },
+            }
+            payload.update(fields)
+            print("[obstacle_car] " + json.dumps(payload, sort_keys=True, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
+
+    def debug_state(self) -> Dict[str, Any]:
+        with self._lock:
+            last_info_t = float(self._last_info_t)
+            last_error = self._last_error
+            last_set_position_msg = None if self._last_set_position_msg is None else dict(self._last_set_position_msg)
+            target = self._target
+            thread_alive = bool(self._thread is not None and self._thread.is_alive())
+            motion_mode = self._motion_mode_debug_locked()
+        last_info_age_s = None if last_info_t <= 0.0 else max(0.0, time.time() - last_info_t)
+        return {
+            "car_name": str(self.conf.get("car_name", "")),
+            "racer_name": str(self.conf.get("racer_name", "")),
+            "guid": str(self.conf.get("guid", "")),
+            "env_id": self.env_id,
+            "scene_key": self.scene_key,
+            "host": self.host,
+            "port": int(self.port),
+            "body_rgb": list(self.conf.get("body_rgb", ())),
+            "font_size": int(self.conf.get("font_size", 0) or 0),
+            "thread_alive": thread_alive,
+            "handler_ready": self._handler() is not None,
+            "motion_mode": motion_mode,
+            "last_info_age_s": None if last_info_age_s is None else round(float(last_info_age_s), 3),
+            "last_error": last_error,
+            "target": None if target is None else {
+                "progress": round(float(target.progress_ratio), 4),
+                "lateral": round(float(target.lateral_ratio), 3),
+                "x": round(float(target.x), 3),
+                "z": round(float(target.z), 3),
+                "yaw": round(float(target.yaw_deg), 1),
+            },
+            "last_set_position": last_set_position_msg,
+        }
+
     def _handler(self):
         if self._env is None:
             return None
@@ -1349,7 +1581,10 @@ class DonkeyObstacleCar:
                 _, world_y_now, _ = telemetry_to_unity_world(
                     pose_now.x, pose_now.y, pose_now.z, self.unity_world_scale
                 )
-                world_y = world_y_now
+                if math.isfinite(float(world_y_now)) and -5.0 <= float(world_y_now) <= 10.0:
+                    world_y = world_y_now
+                else:
+                    world_y = self.default_world_y
             else:
                 world_y = self.default_world_y
 
@@ -1365,6 +1600,16 @@ class DonkeyObstacleCar:
             "Qz": str(qz),
             "Qw": str(qw),
         }
+        with self._lock:
+            self._last_set_position_msg = {
+                "x": round(float(x), 3),
+                "z": round(float(z), 3),
+                "yaw": round(float(yaw_deg), 1),
+                "world_x": round(float(world_x), 3),
+                "world_y": round(float(world_y), 3),
+                "world_z": round(float(world_z), 3),
+                "hold_brake": bool(hold_brake),
+            }
         if hold_brake:
             try:
                 handler.send_control(0.0, 0.0, 1.0)
@@ -1407,11 +1652,20 @@ class DonkeyObstacleCar:
         while not self._stop_evt.is_set():
             try:
                 if self._reset_evt.is_set():
+                    with self._lock:
+                        reset_reason = self._reset_reason or "reset_event"
+                    self._log_debug_event(
+                        "client_reset_start",
+                        reason=reset_reason,
+                        pose=self._pose_debug_payload(self.get_obstacle_pose()),
+                    )
                     self._env.reset()
                     with self._lock:
                         self._last_info = {}
                         self._last_track_idx = None
+                        self._reset_reason = ""
                     self._reset_evt.clear()
+                    self._log_debug_event("client_reset_done", reason=reset_reason)
 
                 pose = self.get_obstacle_pose()
                 now = time.time()
@@ -1443,13 +1697,34 @@ class DonkeyObstacleCar:
 
                 with self._lock:
                     self._last_info = _copy_info(info)
+                    self._last_info_t = time.time()
                     self._last_error = None
 
                 if done and self.auto_reset_on_done:
+                    self._log_debug_event(
+                        "auto_reset_on_done",
+                        pose=self._pose_debug_payload(pose_from_info(info, self.track_geometry, self.scene_key, self._last_track_idx)),
+                        hit=_extract_hit(info),
+                        speed=round(float(_extract_speed(info)), 3),
+                    )
+                    with self._lock:
+                        self._reset_reason = "auto_reset_on_done"
                     self._reset_evt.set()
             except Exception as exc:
+                error_sig = "%s: %s" % (type(exc).__name__, exc)
+                now = time.time()
+                should_log = False
                 with self._lock:
-                    self._last_error = "%s: %s" % (type(exc).__name__, exc)
+                    self._last_error = error_sig
+                    if (
+                        error_sig != self._last_debug_error_sig
+                        or now - float(self._last_debug_error_t) >= 2.0
+                    ):
+                        should_log = True
+                        self._last_debug_error_sig = error_sig
+                        self._last_debug_error_t = now
+                if should_log:
+                    self._log_debug_event("run_loop_error", error=error_sig)
                 time.sleep(0.1)
 
     def _compute_action(self, pose: Optional[PoseState]) -> np.ndarray:
@@ -1577,6 +1852,12 @@ class DonkeyObstacleCar:
 
     def _compute_lane_pid_action(self, pose: Optional[PoseState], cfg: LanePIDConfig) -> np.ndarray:
         if pose is None or self.track_geometry is None or not self.scene_key:
+            with self._lock:
+                self._lane_pid_debug = LanePIDDebugState(
+                    active=0.0,
+                    target_speed=float(max(cfg.target_speed, 0.0)),
+                    effective_lookahead=float(max(cfg.lookahead_m, 0.1)),
+                )
             return np.zeros((2,), dtype=np.float32)
 
         g = self.track_geometry.scenes[self.scene_key]
@@ -1628,11 +1909,13 @@ class DonkeyObstacleCar:
             throttle_cap = float(cfg.max_throttle)
 
         target_speed = float(max(cfg.target_speed, 0.0))
+        speed_now = float(max(pose.speed, 0.0))
+        speed_error = float(target_speed - speed_now)
         if target_speed <= 1e-3:
             throttle = 0.0
         else:
             now = time.time()
-            throttle = self._lane_speed_pid.step(target_speed - float(max(pose.speed, 0.0)), now)
+            throttle = self._lane_speed_pid.step(speed_error, now)
             if throttle > 0.0:
                 throttle = max(float(cfg.min_throttle), throttle)
             alpha = math.atan2(local_left, max(local_forward, 1e-3))
@@ -1643,6 +1926,20 @@ class DonkeyObstacleCar:
 
         with self._lock:
             self._target = lookahead_target
+            self._lane_pid_debug = LanePIDDebugState(
+                active=1.0,
+                target_speed=float(target_speed),
+                speed=float(speed_now),
+                speed_error=float(speed_error),
+                effective_lookahead=float(effective_lookahead),
+                local_forward=float(local_forward),
+                local_left=float(local_left),
+                lookahead_distance=float(lookahead_distance),
+                lat_err_norm=float(geo.get("lat_err_norm", 0.0) or 0.0),
+                steer=float(steer),
+                throttle=float(throttle),
+                reverse_mode=float(local_forward <= 0.05),
+            )
         return np.array([float(steer), float(throttle)], dtype=np.float32)
 
     @staticmethod
@@ -1729,10 +2026,11 @@ def spawn_preset_obstacle_fleet(
                 scene_key=preset.scene_key,
                 host=host,
                 port=int(port),
-                body_style="bare" if preset.name == "ws" else "donkey",
+                # The bare shell sits too low in waveshare and disappears from LiDAR.
+                body_style="donkey",
                 body_rgb=color,
-                car_name=f"{preset.name}_obstacle_{i}",
-                racer_name=f"{preset.name.upper()}-Obs-{i}",
+                car_name=(f"gt obst {i}" if preset.name == "gt" else f"wsobst {i}"),
+                racer_name=(f"gt obst {i}" if preset.name == "gt" else f"wsobst {i}"),
                 bio=f"{preset.name} obstacle car",
                 country="US",
                 auto_reset_on_done=False,

@@ -23,21 +23,65 @@ from .utils import _get_domain_for_env
 # checkpoint + .pth 导出
 # ============================================================
 class PTHExportCallback(BaseCallback):
-    """每 save_freq 步自动导出 .zip + .pth。"""
+    """每 save_freq 步自动导出 .zip + .pth，可选滚动保留最近 N 个。"""
 
-    def __init__(self, save_path: str, save_freq: int = 10000, name_prefix: str = "v12", verbose: int = 0):
+    def __init__(
+        self,
+        save_path: str,
+        save_freq: int = 10000,
+        name_prefix: str = "v12",
+        keep_last: Optional[int] = None,
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.save_path   = save_path
         self.save_freq   = int(max(1, save_freq))
         self.name_prefix = name_prefix
+        self.keep_last = None if keep_last is None else int(max(1, keep_last))
+        self._checkpoint_stems: List[str] = []
         os.makedirs(save_path, exist_ok=True)
+
+    def _on_training_start(self) -> None:
+        if self.keep_last is None:
+            return None
+        import re
+
+        pat = re.compile(rf"^{re.escape(self.name_prefix)}_(\d+)_steps\.zip$")
+        found: List[Tuple[int, str]] = []
+        for fn in os.listdir(self.save_path):
+            m = pat.match(fn)
+            if not m:
+                continue
+            found.append((int(m.group(1)), os.path.join(self.save_path, fn[:-4])))
+        self._checkpoint_stems = [stem for _, stem in sorted(found)]
+        self._prune_old_checkpoints()
+        return None
+
+    def _prune_old_checkpoints(self) -> None:
+        if self.keep_last is None:
+            return
+        while len(self._checkpoint_stems) > self.keep_last:
+            old_stem = self._checkpoint_stems.pop(0)
+            for suffix in (".zip", "_policy.pth"):
+                path = old_stem + suffix
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        if self.verbose > 0:
+                            print(f"🧹 删除旧 checkpoint: {path}")
+                except Exception as e:
+                    if self.verbose > 0:
+                        print(f"🧹 删除旧 checkpoint 失败: {path}: {type(e).__name__}: {e}")
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq == 0:
-            stem = os.path.join(self.save_path, f"{self.name_prefix}_{self.n_calls}_steps")
+            step_id = int(getattr(self, "num_timesteps", self.n_calls))
+            stem = os.path.join(self.save_path, f"{self.name_prefix}_{step_id}_steps")
             self.model.save(stem)
             pth = stem + "_policy.pth"
             torch.save(self.model.policy.state_dict(), pth)
+            self._checkpoint_stems.append(stem)
+            self._prune_old_checkpoints()
             if self.verbose > 0:
                 print(f"\n💾 Checkpoint: {self.n_calls}步 -> {stem}.zip + {pth}")
         return True
@@ -94,18 +138,84 @@ class PerSceneStatsCallback(BaseCallback):
         "ep_r_survival", "ep_r_speed", "ep_r_progress", "ep_r_cte", "ep_r_collision",
         "ep_r_near_offtrack", "ep_r_near_collision",
         "ep_r_center", "ep_r_heading", "ep_r_speed_ref", "ep_r_time",
-        "ep_r_lap", "ep_r_lap_raw", "ep_r_overtake", "ep_overtake_count",
+        "ep_r_lap", "ep_r_lap_raw", "ep_r_follow", "ep_r_wait_window", "ep_r_force_pass",
+        "ep_r_unsafe_close", "ep_r_obstacle_clearance", "ep_r_overtake",
+        "ep_r_post_pass", "ep_r_post_pass_cut_in",
+        "ep_overtake_count", "ep_post_pass_stability_count",
         "ep_soft_lap_count", "ep_r_smooth", "ep_r_jerk",
-        "ep_r_mismatch", "ep_r_sat", "ep_r_total",
+        "ep_r_mismatch", "ep_r_steer_budget", "ep_r_sign_flip", "ep_r_micro_wiggle",
+        "ep_r_sat", "ep_r_stuck", "ep_r_bad_guard", "ep_r_collision_cap",
+        "ep_r_offtrack_cap", "ep_r_total",
     )
     DIAG_EP_KEYS = (
+        "ep_obstacle_has_lane_pid", "ep_obstacle_primary_is_lane_pid",
+        "ep_obstacle_static_count", "ep_obstacle_jitter_count",
+        "ep_obstacle_nudge_count", "ep_obstacle_lane_pid_count",
+        "ep_lane_pid_debug_steps", "ep_lane_pid_target_speed_mean",
+        "ep_lane_pid_speed_mean", "ep_lane_pid_speed_error_abs_mean",
+        "ep_lane_pid_effective_lookahead_mean", "ep_lane_pid_local_forward_mean",
+        "ep_lane_pid_local_left_abs_mean", "ep_lane_pid_lat_err_norm_abs_mean",
+        "ep_lane_pid_steer_abs_mean", "ep_lane_pid_throttle_mean",
+        "ep_lane_pid_reverse_rate",
+        "ep_lidar_valid_frac_mean", "ep_lidar_front_valid_frac_mean",
+        "ep_lidar_new_scan_rate", "ep_lidar_stale_norm_mean",
+        "ep_lidar_min_m_mean", "ep_lidar_min_m_min",
+        "ep_lidar_p10_m_mean", "ep_lidar_p50_m_mean",
+        "ep_lidar_front_min_m_mean", "ep_lidar_front_min_m_min",
+        "ep_lidar_near_0p6_rate", "ep_lidar_near_1p0_rate",
+        "ep_lidar_all_max_rate",
+        "ep_vehicle_prob_mean", "ep_vehicle_prob_max_mean",
+        "ep_vehicle_prob_max_peak", "ep_vehicle_prob_hot_frac_mean",
+        "ep_vehicle_prob_detected_rate", "ep_vehicle_prob_channel_in_obs",
+        "ep_vehicle_prob_lidar_cam_gate_rate",
+        "ep_vehicle_prob_lidar_cam_hit_rate",
+        "ep_vehicle_prob_lidar_cam_miss_rate",
+        "ep_vehicle_prob_lidar_cam_recall",
+        "ep_vehicle_prob_lidar_cam_valid_frac_mean",
+        "ep_vehicle_prob_lidar_cam_min_m_mean",
+        "ep_vehicle_prob_lidar_cam_min_m_min",
         "ep_cte_abs_p50", "ep_cte_abs_p90", "ep_cte_abs_p99",
         "ep_cte_over_in_rate", "ep_cte_over_out_rate",
+        "ep_pass_window_valid_rate", "ep_invalid_window_close_rate", "ep_unsafe_close_rate",
+        "ep_obstacle_clearance_band_rate", "ep_obstacle_clearance_critical_rate",
+        "ep_obstacle_clearance_risk_mean", "ep_obstacle_planar_distance_min",
+        "ep_post_pass_watch_rate", "ep_post_pass_cut_in_rate",
+        "ep_post_pass_cut_in_risk_mean", "ep_post_pass_planar_distance_min",
+        "ep_post_pass_terminal_collision",
+        "ep_overtake_success_ready_rate", "ep_overtake_passed_longitudinal_rate",
+        "ep_overtake_success_clearance_ok_rate", "ep_overtake_success_candidate_rate",
+        "ep_overtake_success_blocked_clearance_rate",
+        "ep_overtake_success_blocked_progress_rate",
+        "ep_overtake_success_blocked_safety_rate", "ep_overtake_success_grant_count",
         "ep_rate_limit_hit_rate", "ep_steer_clip_hit_rate",
         "ep_throttle_high_penalty_hit_rate",
         "ep_offtrack_counter_max", "ep_stuck_counter_max",
+        "ep_bad_episode_guard_triggered", "ep_bad_episode_guard_step",
+        "ep_terminal_offtrack_progress_discount",
+        "ep_speed_mean", "ep_speed_min", "ep_speed_max",
+        "ep_policy_delta_abs_mean", "ep_policy_speed_scale_abs_mean",
+        "ep_policy_line_bias_abs_mean", "ep_adapter_target_steer_abs_mean",
+        "ep_adapter_v_target_mean", "ep_adapter_v_target_min",
+        "ep_adapter_v_target_max", "ep_adapter_v_meas_mean",
+        "ep_adapter_v_meas_min", "ep_adapter_v_meas_max",
+        "ep_adapter_throttle_mean", "ep_sim2real_raw_steer_abs_mean",
+        "ep_sim2real_raw_throttle_mean", "ep_sim2real_steer_abs_mean",
+        "ep_sim2real_throttle_mean", "ep_safety_steer_raw_abs_mean",
+        "ep_safety_steer_exec_abs_mean", "ep_safety_delta_steer_abs_mean",
+        "ep_safety_delta_steer_abs_max", "ep_safety_rate_limit_hit_rate",
+        "ep_safety_rate_excess_bounded_mean", "ep_safety_rate_excess_bounded_max",
+        "ep_safety_delta_delta_steer_abs_mean", "ep_safety_delta_delta_steer_abs_max",
+        "ep_safety_delta_delta_limit_hit_rate",
+        "ep_safety_delta_delta_excess_bounded_mean",
+        "ep_safety_delta_delta_excess_bounded_max",
+        "ep_safety_servo_deadband_hold_rate",
+        "ep_safety_steer_clip_hit_rate",
+        "ep_safety_mismatch_abs_mean", "ep_safety_mismatch_abs_max",
+        "ep_native_env_done_cte_abs", "ep_native_env_done_max_cte",
+        "ep_native_env_done_likely_cte", "ep_native_env_done_likely_hit",
+        "ep_native_env_done_handler_over",
     )
-    TERM_BUCKETS = ("collision", "stuck", "offtrack", "env_done", "normal")
+    TERM_BUCKETS = ("collision", "stuck", "offtrack", "bad_episode_guard", "env_done", "normal")
 
     def __init__(self, check_freq: int = 1000, short_episode_threshold: int = 10, verbose: int = 1):
         super().__init__(verbose)
@@ -140,7 +250,7 @@ class PerSceneStatsCallback(BaseCallback):
             for e in episodes:
                 reason_tokens = set(str(e.get("termination_reason", "normal") or "normal").split("+"))
                 has_special = False
-                for tk in ("collision", "stuck", "offtrack", "env_done"):
+                for tk in ("collision", "stuck", "offtrack", "bad_episode_guard", "env_done"):
                     if tk in reason_tokens:
                         term_counts[tk] += 1
                         has_special = True
@@ -179,9 +289,9 @@ class PerSceneStatsCallback(BaseCallback):
             self.logger.record(f"scene/{sk}_episodes_in_buffer", s["n"])
             self.logger.record(f"scene/{sk}_short_ep_rate", s["short_episode_rate"])
             for key, mean_val in s.get("reward_parts", {}).items():
-                self.logger.record(f"scene/{sk}_{key}_mean", mean_val)
+                self.logger.record(f"scene/{sk}_{key}_mean", mean_val, exclude="stdout")
             for key, mean_val in s.get("diag_parts", {}).items():
-                self.logger.record(f"scene/{sk}_{key}_mean", mean_val)
+                self.logger.record(f"scene/{sk}_{key}_mean", mean_val, exclude="stdout")
             for key, rate_val in s.get("term_rates", {}).items():
                 self.logger.record(f"scene/{sk}_{key}_rate", rate_val)
 
@@ -194,10 +304,28 @@ class PerSceneStatsCallback(BaseCallback):
             for sk in sorted(stats.keys()):
                 s = stats[sk]
                 short_pct = s["short_episode_rate"] * 100
+                diag = s.get("diag_parts", {})
+                veh_det = diag.get("ep_vehicle_prob_detected_rate")
+                veh_peak = diag.get("ep_vehicle_prob_max_peak")
+                veh_cam_gate = diag.get("ep_vehicle_prob_lidar_cam_gate_rate")
+                veh_cam_recall = diag.get("ep_vehicle_prob_lidar_cam_recall")
+                veh_txt = ""
+                if veh_det is not None and np.isfinite(veh_det):
+                    veh_txt = f", veh={veh_det:.2f}"
+                    if veh_peak is not None and np.isfinite(veh_peak):
+                        veh_txt += f"/{veh_peak:.2f}"
+                    if (
+                        veh_cam_gate is not None
+                        and veh_cam_recall is not None
+                        and np.isfinite(veh_cam_gate)
+                        and np.isfinite(veh_cam_recall)
+                    ):
+                        veh_txt += f", cam={veh_cam_gate:.2f}/{veh_cam_recall:.2f}"
                 parts.append(
                     f"{sk}: n={s['n']}, rew={s['mean_reward']:.1f}, len={s['mean_len']:.0f}"
                     + (f", short={short_pct:.0f}%" if short_pct > 5 else "")
                     + (f", cov={s['mean_cov']:.3f}" if not np.isnan(s["mean_cov"]) else "")
+                    + veh_txt
                 )
             print("📈 按场景统计 | " + " | ".join(parts))
         return True
@@ -205,6 +333,75 @@ class PerSceneStatsCallback(BaseCallback):
 
 # 向下兼容别名
 PerDomainStatsCallback = PerSceneStatsCallback
+
+
+# ============================================================
+# 动作链路诊断
+# ============================================================
+class ActionDiagnosticsCallback(BaseCallback):
+    """Aggregate recent policy/adapter/sim2real/safety action diagnostics."""
+
+    DEFAULT_KEYS = (
+        "speed",
+        "action/policy_delta_abs",
+        "action/policy_speed_scale_abs",
+        "action/policy_line_bias_abs",
+        "ctrl/v_target",
+        "ctrl/v_meas",
+        "ctrl/target_steer_abs",
+        "ctrl/throttle_pi",
+        "sim2real/raw_steer_abs",
+        "sim2real/raw_throttle",
+        "sim2real/steer_abs",
+        "sim2real/throttle",
+        "safety/steer_raw_abs",
+        "safety/steer_exec_abs",
+        "safety/rate_limit_hit",
+        "safety/steer_clip_hit",
+        "safety/rate_excess_bounded",
+        "safety/delta_steer_abs",
+        "safety/delta_delta_steer_abs",
+        "safety/delta_delta_limit_hit",
+        "safety/delta_delta_excess_bounded",
+        "safety/servo_deadband_hold",
+        "safety/mismatch_abs",
+    )
+
+    def __init__(
+        self,
+        check_freq: int = 1000,
+        window: int = 1000,
+        keys: Optional[Tuple[str, ...]] = None,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.check_freq = int(max(1, check_freq))
+        self.window = int(max(1, window))
+        self.keys = tuple(keys or self.DEFAULT_KEYS)
+        self.buffers = {key: deque(maxlen=self.window) for key in self.keys}
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            for key in self.keys:
+                if key not in info:
+                    continue
+                try:
+                    value = float(info.get(key, 0.0) or 0.0)
+                except Exception:
+                    continue
+                if np.isfinite(value):
+                    self.buffers[key].append(value)
+
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        for key, values in self.buffers.items():
+            if values:
+                self.logger.record(f"{key}_mean", float(np.mean(values)), exclude="stdout")
+        return True
 
 
 # ============================================================
@@ -523,6 +720,7 @@ class TrainingMetricsFileLoggerCallback(BaseCallback):
     DEFAULT_PREFIXES = (
         "train/", "domain/", "coverage/", "rollout/", "eval/", "time/",
         "scene/", "short_ep/", "ctrl/", "geo/", "seg/", "smooth/", "reward_debug/",
+        "critic_calib/", "action/", "sim2real/", "safety/",
     )
 
     def __init__(
@@ -662,6 +860,7 @@ class BestModelCallback(BaseCallback):
         scene_keys: Optional[Tuple[str, ...]] = None,
         domain_keys: Optional[Tuple[str, ...]] = None,  # 已废弃，优先用 scene_keys
         save_balanced_from_training_buffer: bool = False,
+        name_prefix: str = "best_model",
         verbose: int = 0,
         # 旧参数别名
         min_episodes_per_domain_for_save: Optional[int] = None,
@@ -685,6 +884,7 @@ class BestModelCallback(BaseCallback):
         else:
             self.scene_keys = None  # None = 动态发现所有场景
         self.save_balanced = bool(save_balanced_from_training_buffer)
+        self.name_prefix = str(name_prefix or "best_model")
         os.makedirs(save_path, exist_ok=True)
 
         self.best_global_mean_reward = -np.inf
@@ -697,6 +897,11 @@ class BestModelCallback(BaseCallback):
         pth_path = os.path.join(self.save_path, f"{stem}_policy.pth")
         torch.save(self.model.policy.state_dict(), pth_path)
         return zip_path + ".zip", pth_path
+
+    def _stem(self, suffix: Optional[str] = None) -> str:
+        if suffix is None or suffix == "":
+            return self.name_prefix
+        return f"{self.name_prefix}_{suffix}"
 
     def _split_ep_info(self):
         episodes = list(self.model.ep_info_buffer)
@@ -760,8 +965,9 @@ class BestModelCallback(BaseCallback):
 
         if global_mean > self.best_global_mean_reward:
             self.best_global_mean_reward = global_mean
-            self._save_pair("best_model_global")
-            self._save_pair("best_model")   # 兼容旧路径
+            self._save_pair(self._stem("global"))
+            if self.name_prefix == "best_model":
+                self._save_pair(self._stem())   # 兼容旧路径
             if self.verbose > 0:
                 print(f"⭐ 新全局最佳: {global_mean:.2f}")
 
@@ -771,13 +977,13 @@ class BestModelCallback(BaseCallback):
                     continue
                 if mr > self.best_per_scene_reward.get(sk, -np.inf):
                     self.best_per_scene_reward[sk] = mr
-                    z, p = self._save_pair(f"best_model_{sk}")
+                    z, p = self._save_pair(self._stem(str(sk)))
                     if self.verbose > 0:
                         print(f"⭐ 新场景 [{sk}] 最佳: {mr:.2f} -> {z}")
 
         if self.save_balanced and balanced is not None and balanced > self.best_balanced_score:
             self.best_balanced_score = balanced
-            z, p = self._save_pair("best_model_balanced")
+            z, p = self._save_pair(self._stem("balanced"))
             if self.verbose > 0:
                 print(f"⭐ 新平衡最佳(缓冲区): {balanced:.2f}")
         return True
@@ -797,7 +1003,7 @@ class CrashRecoveryCallback(BaseCallback):
     检测逻辑:
       1. 维护每个场景的 ep_len 峰值 (peak) 和最近 N 局的滑动平均 (rolling)
       2. 当 rolling < peak * crash_ratio 且 peak 超过 min_peak_len 时判定为崩溃
-      3. 回滚到 save_dir 下最近的常规 checkpoint (v13_*_steps.zip)
+      3. 回滚到 save_dir 下最近的常规 checkpoint ({checkpoint_prefix}_*_steps.zip)
       4. 回滚后进入冷却期，冷却期间不检测
 
     回滚行为:
@@ -867,9 +1073,9 @@ class CrashRecoveryCallback(BaseCallback):
             tmp_model = RecurrentPPO.load(ckpt)
             old_state = tmp_model.policy.state_dict()
             self.model.policy.load_state_dict(old_state)
-            # 同步 optimizer 的参数引用
-            for pg in self.model.policy.optimizer.param_groups:
-                pg["params"] = [p for p in self.model.policy.parameters() if p.requires_grad]
+            # load_state_dict copies tensors into existing Parameter objects.
+            # Keep optimizer parameter groups intact; V17 uses multiple groups
+            # and replacing each group with all policy params corrupts checkpoints.
             del tmp_model
             self._rollback_count += 1
             self._last_rollback_step = self.num_timesteps
@@ -1020,6 +1226,21 @@ class ShortEpisodeLoggerCallback(BaseCallback):
                 "episode_reward":    float(ep_reward) if np.isfinite(float(ep_reward)) else None,
                 "scene_key":         str(scene_key),
                 "termination_reason": str(term_reason),
+                "ep_native_env_done_reason": str(
+                    ep.get("ep_native_env_done_reason") or info.get("ep_native_env_done_reason", "")
+                ),
+                "ep_native_env_done_likely_cte": float(
+                    ep.get("ep_native_env_done_likely_cte", info.get("ep_native_env_done_likely_cte", 0.0)) or 0.0
+                ),
+                "ep_native_env_done_likely_hit": float(
+                    ep.get("ep_native_env_done_likely_hit", info.get("ep_native_env_done_likely_hit", 0.0)) or 0.0
+                ),
+                "ep_native_env_done_cte_abs": float(
+                    ep.get("ep_native_env_done_cte_abs", info.get("ep_native_env_done_cte_abs", 0.0)) or 0.0
+                ),
+                "ep_native_env_done_max_cte": float(
+                    ep.get("ep_native_env_done_max_cte", info.get("ep_native_env_done_max_cte", 0.0)) or 0.0
+                ),
                 "total_short":       self._total_short,
             }
             if self._fh is not None:

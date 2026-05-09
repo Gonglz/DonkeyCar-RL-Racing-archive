@@ -1,6 +1,6 @@
 """
 module/obv.py
-V13 观测空间：6 通道语义图像 + 5 维纯传感器状态。
+V13/V17 观测空间：6 通道语义图像 + 5/7 维纯传感器状态。
 
 观测结构
 --------
@@ -9,7 +9,7 @@ image: (6, obs_size, obs_size) float32 [0, 1]
   ch1  edge_line_prob      车边线软概率（跨域 canonical 语义）
   ch2  guide_line_prob     中线/引导线软概率（跨域 canonical 语义，渐进 dropout）
   ch3  sobel_edge          Sobel 边缘图（raw_Y）
-  ch4  vehicle_prob        动态目标软概率（GreenVehicleDetector）
+  ch4  vehicle_prob        rawpink 障碍车颜色软概率（宽松固定粉色）
   ch5  motion_residual     |Y_t - Y_{t-1}|，reset 后置零
 
 state: (5,) float32
@@ -30,7 +30,7 @@ state: (5,) float32
 RGB/BGR 约定
 ------------
 - DonkeyEnv 输出 RGB
-- GreenVehicleDetector 与线提取器期望 BGR
+- rawpink/obstacle-color detector 与线提取器期望 BGR
 - cv2.resize 参数顺序：(width, height)，即 (W, H)
 """
 
@@ -65,7 +65,7 @@ class CanonicalSemanticWrapper(gym.ObservationWrapper):
       ch1  edge_line_prob      车边线软概率（跨域 canonical 语义）
       ch2  guide_line_prob     中线/引导线软概率（跨域 canonical 语义，渐进 dropout）
       ch3  sobel_edge          Sobel 边缘图（raw_Y）
-      ch4  vehicle_prob        动态目标软概率（GreenVehicleDetector）
+      ch4  vehicle_prob        rawpink 障碍车颜色软概率（宽松固定粉色）
       ch5  motion_residual     |Y_t - Y_{t-1}|，reset 后清零
     """
 
@@ -183,9 +183,6 @@ class CanonicalSemanticWrapper(gym.ObservationWrapper):
         self._prev_y: Optional[np.ndarray] = None
         self._prev_ws_white_prob: Optional[np.ndarray] = None
 
-        from .green_vehicle_detect import GreenVehicleDetector
-        self._green_det = GreenVehicleDetector()
-
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0,
             shape=(6, self.obs_size, self.obs_size),
@@ -250,6 +247,103 @@ class CanonicalSemanticWrapper(gym.ObservationWrapper):
             return white, yellow
 
         return self._extract_generic_lane_masks(img_bgr)
+
+    def _refine_vehicle_prob(
+        self,
+        veh_prob: np.ndarray,
+        white_prob: np.ndarray,
+        yellow_prob: np.ndarray,
+        edge: np.ndarray,
+        motion: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Shared line-structure suppression for vehicle_prob.
+
+        Goal:
+          - keep one unified logic for WS/GT
+          - suppress false vehicle responses that are really lane/edge structures
+          - preserve true compact moving blobs when vehicle evidence is strong
+        """
+        veh_prob = np.clip(np.asarray(veh_prob, dtype=np.float32), 0.0, 1.0)
+        if float(np.max(veh_prob)) < 1e-4:
+            return veh_prob
+
+        white_prob = np.clip(np.asarray(white_prob, dtype=np.float32), 0.0, 1.0)
+        yellow_prob = np.clip(np.asarray(yellow_prob, dtype=np.float32), 0.0, 1.0)
+        edge = np.clip(np.asarray(edge, dtype=np.float32), 0.0, 1.0)
+        motion = np.clip(np.asarray(motion, dtype=np.float32), 0.0, 1.0)
+
+        h_img, w_img = veh_prob.shape[:2]
+        line_map = np.maximum(white_prob, yellow_prob)
+        line_support = cv2.GaussianBlur(line_map, (5, 5), sigmaX=1.0)
+        edge_support = cv2.GaussianBlur(edge, (5, 5), sigmaX=1.0)
+        motion_support = cv2.GaussianBlur(motion, (5, 5), sigmaX=1.0)
+
+        refined = veh_prob.copy()
+        seed_mask = (veh_prob >= 0.06).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        seed_mask = cv2.morphologyEx(seed_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(seed_mask, connectivity=8)
+        if n <= 1:
+            penalty = np.clip(0.80 * line_support + 0.35 * edge_support, 0.0, 1.0)
+            keep = np.clip(0.30 + 0.70 * motion_support, 0.0, 1.0)
+            refined = np.clip(refined * (1.0 - penalty) + refined * keep * 0.25, 0.0, 1.0)
+            return refined.astype(np.float32)
+
+        for idx in range(1, n):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 6:
+                refined[labels == idx] *= 0.2
+                continue
+
+            x = int(stats[idx, cv2.CC_STAT_LEFT])
+            y = int(stats[idx, cv2.CC_STAT_TOP])
+            w = int(stats[idx, cv2.CC_STAT_WIDTH])
+            h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            comp = labels == idx
+
+            mean_veh = float(np.mean(veh_prob[comp]))
+            max_veh = float(np.max(veh_prob[comp]))
+            mean_line = float(np.mean(line_support[comp]))
+            mean_edge = float(np.mean(edge_support[comp]))
+            mean_motion = float(np.mean(motion_support[comp]))
+            support_ratio = float(np.mean(veh_prob[comp] >= 0.10))
+            aspect = float(max(h, w) / max(min(h, w), 1.0))
+            width_norm = float(w / max(w_img, 1))
+            bottom_norm = float((y + h) / max(h_img, 1))
+
+            line_like = (
+                mean_line > 0.10
+                and mean_edge > 0.08
+                and aspect > 1.6
+                and width_norm < 0.16
+            )
+            weak_vehicle = (
+                max_veh < 0.22
+                and mean_veh < 0.12
+                and support_ratio < 0.22
+            )
+            likely_artifact = line_like and weak_vehicle and mean_motion < 0.10
+
+            if likely_artifact:
+                refined[comp] *= 0.08
+                continue
+
+            penalty = np.clip(0.75 * mean_line + 0.28 * mean_edge, 0.0, 0.92)
+            keep_gain = np.clip(
+                0.25
+                + 0.55 * max_veh
+                + 0.20 * support_ratio
+                + 0.12 * mean_motion
+                + 0.08 * np.clip(bottom_norm, 0.0, 1.0),
+                0.15,
+                1.0,
+            )
+            refined[comp] *= max(0.06, 1.0 - penalty) * keep_gain
+
+        refined = cv2.GaussianBlur(refined, (5, 5), sigmaX=1.2)
+        return np.clip(refined, 0.0, 1.0).astype(np.float32)
 
     # ------------------------------------------------------------------
     # 主观测构建
@@ -394,13 +488,11 @@ class CanonicalSemanticWrapper(gym.ObservationWrapper):
         if self.augment and np.random.random() < self._get_yellow_dropout():
             yellow_prob = np.zeros_like(yellow_prob, dtype=np.float32)   # 渐进 dropout
 
-        # ch4: vehicle prob（GreenVehicleDetector，期望 BGR）
-        det = self._green_det.detect(raw_bgr)
-        if det.detected:
-            veh = (det.mask > 0).astype(np.float32)
-            veh_prob = cv2.GaussianBlur(veh, (5, 5), sigmaX=1.5)
-        else:
-            veh_prob = np.zeros((self.H, self.W), dtype=np.float32)
+        # ch4: rawpink vehicle prob. Keep this as a loose color cue rather
+        # than a hard detection so lighting/color shifts degrade gracefully.
+        from .green_vehicle_detect import raw_pink_prob
+
+        veh_prob = raw_pink_prob(raw_bgr, roi_top_frac=0.10)
 
         # ch5: motion residual |Y_t - Y_{t-1}|，放大小运动
         if self._prev_y is not None:
@@ -424,7 +516,7 @@ class CanonicalSemanticWrapper(gym.ObservationWrapper):
 
 
 # ============================================================
-# _build_state_v13
+# _build_state_v13 / _build_state_v17 / _build_state_v16
 # ============================================================
 def _build_state_v13(
     info: Dict[str, Any],
@@ -506,6 +598,26 @@ def _build_state_v13(
     ], dtype=np.float32)
 
 
+def _build_state_v17(
+    info: Dict[str, Any],
+    action_safety_wrapper,
+    control_wrapper,
+    v_max: float = 2.2,
+) -> np.ndarray:
+    """
+    V17 policy core state.
+
+    保持 V13 的 7D 控制/动力学核心，不再把 obstacle-5 压入 policy state。
+    LiDAR 及其异步 meta 在独立观测键中提供，由特征提取器内部再与 state 融合。
+    """
+    return _build_state_v13(
+        info=info,
+        action_safety_wrapper=action_safety_wrapper,
+        control_wrapper=control_wrapper,
+        v_max=v_max,
+    )
+
+
 def _build_state_v16(
     info: Dict[str, Any],
     action_safety_wrapper,
@@ -524,7 +636,8 @@ def _build_state_v16(
     设计原则：
     - 保留 V13 的控制内态，避免 action adapter 学习重置
     - 障碍信息来自 runtime wrapper 注入的 info，不依赖赛道几何
-    - 当本步无障碍信号时，新增 5 维全部退化为 0
+    - 保持与历史 V16 checkpoint 兼容，state 固定为 12 维
+    - 当本步无障碍信号时，新增 5 维退化为 0
     """
     base = _build_state_v13(
         info=info,
@@ -533,26 +646,17 @@ def _build_state_v16(
         v_max=v_max,
     )
 
-    try:
-        obstacle_present = float(info.get("obstacle_present", 0.0) or 0.0)
-    except Exception:
-        obstacle_present = 0.0
-    try:
-        obstacle_longitudinal = float(info.get("obstacle_longitudinal", 0.0) or 0.0)
-    except Exception:
-        obstacle_longitudinal = 0.0
-    try:
-        obstacle_lateral = float(info.get("obstacle_lateral", 0.0) or 0.0)
-    except Exception:
-        obstacle_lateral = 0.0
-    try:
-        obstacle_dist = float(info.get("obstacle_dist", 0.0) or 0.0)
-    except Exception:
-        obstacle_dist = 0.0
-    try:
-        obstacle_risk = float(info.get("obstacle_risk", 0.0) or 0.0)
-    except Exception:
-        obstacle_risk = 0.0
+    def _get_float(name: str) -> float:
+        try:
+            return float(info.get(name, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    obstacle_present = _get_float("obstacle_present")
+    obstacle_longitudinal = _get_float("obstacle_longitudinal")
+    obstacle_lateral = _get_float("obstacle_lateral")
+    obstacle_dist = _get_float("obstacle_dist")
+    obstacle_risk = _get_float("obstacle_risk")
 
     obstacle_state = np.array([
         float(np.clip(obstacle_present, 0.0, 1.0)),

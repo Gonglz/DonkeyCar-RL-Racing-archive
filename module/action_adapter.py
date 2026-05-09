@@ -68,6 +68,7 @@ class ActionAdapterWrapper(gym.ActionWrapper):
         integral_limit: float = 3.0,
         max_throttle: float = 0.3,
         allow_reverse: bool = False,
+        predictive_safety_filter=None,
     ):
         super().__init__(env)
 
@@ -93,6 +94,7 @@ class ActionAdapterWrapper(gym.ActionWrapper):
         self.integral_limit = float(max(0.1, integral_limit))
         self.max_throttle = float(max(0.05, max_throttle))
         self.allow_reverse = bool(allow_reverse)
+        self.predictive_safety_filter = predictive_safety_filter
 
         # 3D action space
         self.action_space = gym.spaces.Box(
@@ -106,6 +108,8 @@ class ActionAdapterWrapper(gym.ActionWrapper):
         self.bias_smooth: float = 0.0
         self.i_term: float = 0.0
         self.last_speed_mps: float = 0.0
+        self.last_gyro_y: float = 0.0
+        self.last_accel_x: float = 0.0
         self.last_low_level_action = np.array([0.0, 0.0], dtype=np.float32)
         self.diag: Dict[str, float] = self._zero_diag()
 
@@ -140,6 +144,9 @@ class ActionAdapterWrapper(gym.ActionWrapper):
             "delta_steer_input": 0.0,
             "speed_scale_input": 0.0,
             "line_bias_input": 0.0,
+            "safety_filter_triggered": 0.0,
+            "safety_filter_trigger_rate": 0.0,
+            "safety_filter_throttle_scale": 1.0,
         }
 
     # ── interface: consume_info ──────────────────────────────
@@ -151,6 +158,16 @@ class ActionAdapterWrapper(gym.ActionWrapper):
             self.last_speed_mps = float(v)
         except Exception:
             self.last_speed_mps = 0.0
+        gyro = info.get("gyro", (0.0, 0.0, 0.0))
+        accel = info.get("accel", (0.0, 0.0, 0.0))
+        try:
+            self.last_gyro_y = float(gyro[1])
+        except Exception:
+            self.last_gyro_y = 0.0
+        try:
+            self.last_accel_x = float(accel[0])
+        except Exception:
+            self.last_accel_x = 0.0
 
     # ── core: action translation ─────────────────────────────
 
@@ -213,6 +230,34 @@ class ActionAdapterWrapper(gym.ActionWrapper):
         else:
             throttle = _clip_float(throttle, 0.0, self.max_throttle)
 
+        safety_triggered = 0.0
+        safety_trigger_rate = 0.0
+        safety_throttle_scale = 1.0
+        if self.predictive_safety_filter is not None:
+            try:
+                from .predictive_safety_filter import PhysState
+
+                phys = PhysState.from_raw(
+                    speed_mps=self.last_speed_mps,
+                    gyro_z=self.last_gyro_y,
+                    accel_x=self.last_accel_x,
+                )
+                triggered, _preds, diag = self.predictive_safety_filter.check(
+                    steer_target=steer_target,
+                    throttle=throttle,
+                    phys=phys,
+                    dt_ms=self.control_dt * 1000.0,
+                )
+                safety_triggered = float(bool(triggered))
+                safety_trigger_rate = float(diag.get("trigger_rate", 0.0) or 0.0)
+                safety_throttle_scale = float(diag.get("throttle_scale", 1.0) or 1.0)
+                if bool(triggered) and str(getattr(self.predictive_safety_filter, "mode", "log")).lower() == "intervene":
+                    throttle = _clip_float(throttle * safety_throttle_scale, 0.0, self.max_throttle)
+            except Exception:
+                safety_triggered = 0.0
+                safety_trigger_rate = 0.0
+                safety_throttle_scale = 1.0
+
         # 7. store output
         low_level = np.array([steer_target, throttle], dtype=np.float32)
         self.last_low_level_action = low_level
@@ -229,6 +274,9 @@ class ActionAdapterWrapper(gym.ActionWrapper):
             "delta_steer_input": float(delta_steer),
             "speed_scale_input": float(speed_scale),
             "line_bias_input": float(line_bias),
+            "safety_filter_triggered": float(safety_triggered),
+            "safety_filter_trigger_rate": float(safety_trigger_rate),
+            "safety_filter_throttle_scale": float(safety_throttle_scale),
         }
         return low_level
 
@@ -239,9 +287,24 @@ class ActionAdapterWrapper(gym.ActionWrapper):
         self.bias_smooth = 0.0
         self.i_term = 0.0
         self.last_speed_mps = 0.0
+        self.last_gyro_y = 0.0
+        self.last_accel_x = 0.0
         self.last_low_level_action = np.array([0.0, 0.0], dtype=np.float32)
         self.diag = self._zero_diag()
+        if self.predictive_safety_filter is not None:
+            try:
+                self.predictive_safety_filter.reset()
+            except Exception:
+                pass
         return self.env.reset(**kwargs)
+
+    def close(self):
+        if self.predictive_safety_filter is not None:
+            try:
+                self.predictive_safety_filter.close()
+            except Exception:
+                pass
+        return self.env.close()
 
 
 __all__ = ["ActionAdapterWrapper"]

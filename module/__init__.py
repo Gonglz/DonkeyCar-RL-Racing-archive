@@ -22,6 +22,16 @@ from .control import (
     ActionSafetyWrapper, ThrottleControlWrapper, CurvatureAwareThrottleWrapper,
 )
 from .action_adapter import ActionAdapterWrapper
+from .lidar import (
+    CanonicalLidarSpec,
+    DEFAULT_CANONICAL_LIDAR_SPEC,
+    SimAsyncLidarBuffer,
+    canonical_lidar_from_scan,
+    canonical_lidar_from_sim_array,
+    flatten_canonical_lidar,
+)
+from .local_world_model_v17 import LocalWorldModelV17, local_world_model_loss
+from .predictive_safety_filter import PredictiveSafetyFilter, PhysState
 from .robust_lane_detector import RobustLaneDetector, RobustYellowLaneEnhancer
 from .wrappers import (
     GeneralizationWrapper, TransposeWrapper, NormalizeWrapper,
@@ -42,4 +52,8 @@ from .multi_scene_env import (
     _build_v12_wrapper_chain,
     _build_state_v13, _build_state_v16,
 )
+from .v17_callbacks import CriticCalibrationCallback
+from .v17_env import MultiSceneEnvV17, V17ObsWrapper
+from .v17_policy import LiDARFiLMFeatureExtractor, V17RecurrentMultiInputPolicy
+from .world_model import NeuralPhysicsDynamics, build_input_5d, build_input_8d
 # All V8/V9 components unified here so v12 has no cross-file imports.

@@ -51,8 +51,8 @@ Warmup placement:
 
 Obstacle color:
 
-- pure green `(0, 255, 0)`
-- aligned with `mysim/module/green_vehicle_detect.py`
+- fixed pink `(255, 105, 180)`
+- aligned with the current obstacle-color detector in `module/green_vehicle_detect.py`
 
 ## Logs
 

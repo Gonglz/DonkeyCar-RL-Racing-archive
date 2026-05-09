@@ -31,3 +31,6 @@ Notes:
 - If you later want to sync models or datasets, use separate storage instead of
   checking large binaries into git by default.
 - V16 dual-domain obstacle curriculum details live in `docs/V16_CURRICULUM.md`.
+- V17 dual-sim persistent-env scene-switch design (fixes 100% in-place reload
+  failure, eliminates zombie-car leak, +29% throughput): see
+  `docs/DUAL_SIM_SCENE_SWITCH_2026-04-28.md`.

@@ -181,6 +181,8 @@ class ActionSafetyWrapper(gym.ActionWrapper):
         delta_max: float = 0.5,
         enable_lpf: bool = True,
         beta: float = 0.6,
+        delta_delta_max: Optional[float] = None,
+        servo_deadband: float = 0.0,
         adaptive_delta_max: bool = False,
         curve_delta_boost: float = 0.0,
         curve_kappa_ref: float = 0.15,
@@ -193,6 +195,12 @@ class ActionSafetyWrapper(gym.ActionWrapper):
         self.delta_max = float(np.clip(delta_max, 0.0, 1.0))
         self.enable_lpf = bool(enable_lpf)
         self.beta = float(np.clip(beta, 0.0, 1.0))
+        self.delta_delta_max = (
+            None
+            if delta_delta_max is None or float(delta_delta_max) <= 0.0
+            else float(np.clip(delta_delta_max, 0.0, 1.0))
+        )
+        self.servo_deadband = float(np.clip(servo_deadband, 0.0, 0.2))
         self.last_kappa_abs = 0.0
 
         # 兼容旧参数（仅保留字段，不参与决策）
@@ -206,12 +214,15 @@ class ActionSafetyWrapper(gym.ActionWrapper):
 
         self.steer_prev_limited = 0.0
         self.steer_prev_exec = 0.0
+        self.steer_delta_prev_limited = 0.0
         self.delta_steer_prev = 0.0
         self.diag: Dict[str, Any] = self._zero_diag()
 
         print(
             f"🛡️  ActionSafetyWrapper(simple): delta_max={self.delta_max:.3f}, "
             f"LPF={'on' if self.enable_lpf else 'off'} (beta={self.beta:.2f}), "
+            f"ddelta_max={self.delta_delta_max if self.delta_delta_max is not None else 0.0:.3f}, "
+            f"deadband={self.servo_deadband:.3f}, "
             f"adaptive=off"
         )
 
@@ -224,6 +235,12 @@ class ActionSafetyWrapper(gym.ActionWrapper):
             "rate_limit_hit": False,
             "rate_excess_raw": 0.0,
             "rate_excess_bounded": 0.0,
+            "delta_delta_steer": 0.0,
+            "delta_delta_steer_abs": 0.0,
+            "delta_delta_limit_hit": False,
+            "delta_delta_excess_raw": 0.0,
+            "delta_delta_excess_bounded": 0.0,
+            "servo_deadband_hold": False,
             "steer_clip_hit": False,
             "mismatch": 0.0,
             "effective_delta_max": float(self.delta_max),
@@ -256,6 +273,24 @@ class ActionSafetyWrapper(gym.ActionWrapper):
         )
         if effective_delta_max > 0.0 and abs(delta) > effective_delta_max:
             delta = np.clip(delta, -effective_delta_max, effective_delta_max)
+
+        delta_delta = float(delta - self.steer_delta_prev_limited)
+        delta_delta_limit_hit = False
+        delta_delta_excess_raw = 0.0
+        if self.delta_delta_max is not None and self.delta_delta_max > 0.0:
+            delta_delta_limit_hit = abs(delta_delta) > self.delta_delta_max
+            delta_delta_excess_raw = (
+                max(0.0, abs(delta_delta) - self.delta_delta_max)
+                / max(self.delta_delta_max, 1e-6)
+            )
+            if delta_delta_limit_hit:
+                delta_delta = float(np.clip(delta_delta, -self.delta_delta_max, self.delta_delta_max))
+                delta = float(self.steer_delta_prev_limited + delta_delta)
+
+        servo_deadband_hold = False
+        if self.servo_deadband > 0.0 and abs(delta) < self.servo_deadband:
+            delta = 0.0
+            servo_deadband_hold = True
         steer_limited = self.steer_prev_limited + delta
 
         if self.enable_lpf:
@@ -275,12 +310,19 @@ class ActionSafetyWrapper(gym.ActionWrapper):
             "rate_limit_hit": rate_limit_hit,
             "rate_excess_raw": rate_excess_raw,
             "rate_excess_bounded": float(np.tanh(rate_excess_raw)),
+            "delta_delta_steer": float(delta - self.steer_delta_prev_limited),
+            "delta_delta_steer_abs": abs(float(delta - self.steer_delta_prev_limited)),
+            "delta_delta_limit_hit": delta_delta_limit_hit,
+            "delta_delta_excess_raw": delta_delta_excess_raw,
+            "delta_delta_excess_bounded": float(np.tanh(delta_delta_excess_raw)),
+            "servo_deadband_hold": servo_deadband_hold,
             "steer_clip_hit": steer_clip_hit,
             "mismatch": steer_raw - steer_exec,
             "effective_delta_max": effective_delta_max,
             "kappa_for_limit": float(self.last_kappa_abs),
             "hairpin_relax_active": False,
         }
+        self.steer_delta_prev_limited = float(delta)
         self.delta_steer_prev = actual_delta
         self.steer_prev_limited = steer_limited
         self.steer_prev_exec = steer_exec
@@ -289,6 +331,7 @@ class ActionSafetyWrapper(gym.ActionWrapper):
     def reset(self, **kwargs):
         self.steer_prev_limited = 0.0
         self.steer_prev_exec = 0.0
+        self.steer_delta_prev_limited = 0.0
         self.delta_steer_prev = 0.0
         self.last_kappa_abs = 0.0
         self.diag = self._zero_diag()
@@ -432,4 +475,3 @@ __all__ = [
     "ThrottleControlWrapper",
     "CurvatureAwareThrottleWrapper",
 ]
-

@@ -65,19 +65,29 @@ DEFAULT_TRACK_DIR = os.environ.get("MYSIM_TRACK_DIR", str(REPO_ROOT / "track_pro
 DEFAULT_MYCONFIG = os.environ.get("MYSIM_MYCONFIG", str(REPO_ROOT / "myconfig.py"))
 WS_FINISH_OBSTACLE_PROGRESS_RATIO_V16 = 0.5  # 改为对面(0.08太近，learner一出生就撞)
 
+# WS 在正式避障阶段统一复用同一套“静态 + 边缘 + 中后段 progress”放置逻辑，
+# 避免 avoid/pid 阶段各自维护一份后逐渐分叉。
+WS_SHARED_AVOID_PLACEMENT_V16: Dict[str, Any] = {
+    "ws_obstacle_modes": ["static"],
+    "ws_obstacle_progress_min": 0.20,
+    "ws_obstacle_progress_max": 0.80,
+    "ws_obstacle_fixed_lateral_ratio": None,
+}
+
 WS_REWARD_OVERRIDES_V16: Dict[str, float] = {
     # WS 赛道更窄，避障时经常需要主动吃一点边界/出界代价。
     # 这里让 WS 更偏向“先避障、再回正”，同时抑制
     # “高进度奖励 + 短回合碰撞也不亏”的激进策略：
-    # - 降低 near/offtrack 与中心线约束
-    # - 保留前进驱动，但更早、更明确地惩罚碰撞风险
+    # - 降低 near/offtrack 与中心线约束，允许避障时多吃一点边线代价
+    # - 保留前进驱动，但更早、更明确地惩罚贴车/碰撞风险
     "cte_norm_scale": 0.50,
-    "w_near_offtrack": 0.36,
-    "near_offtrack_start_ratio": 0.60,
-    "offtrack_penalty_base": 3.5,
-    "collision_penalty_base": 10.0,   # 提升：碰撞惩罚从7→10，压制"边撞边跑"策略
-    "w_near_collision": 0.32,          # 提升：WS近障预警从0.16→0.32，高于phase全局值
-    "near_collision_start_ratio": 0.65, # 提前触发：72%→65%，更早感知近障
+    "w_near_offtrack": 0.28,
+    "near_offtrack_start_ratio": 0.68,
+    "offtrack_penalty_base": 3.0,
+    "collision_penalty_base": 18.0,
+    "w_near_collision": 0.50,
+    "near_collision_start_ratio": 0.58,
+    "safe_follow_bonus_scale": 0.035,
     "w_center": 0.020,
     "w_heading": 0.012,
     "progress_reward_scale": 50.0,
@@ -203,10 +213,7 @@ CURRICULUM_PHASES: Dict[str, Dict[str, Any]] = {
         "obstacle_progress_min": 0.20,  # GT障碍范围：20%-80%
         "obstacle_progress_max": 0.80,
         "ws_obstacle_free_prob": 0.20,
-        "ws_obstacle_modes": ["static"],
-        "ws_obstacle_progress_min": 0.20,  # WS障碍范围：20%-80%
-        "ws_obstacle_progress_max": 0.80,
-        "ws_obstacle_fixed_lateral_ratio": None,   # 修复：随机边缘放置，WS太窄无法绕开中央障碍
+        **WS_SHARED_AVOID_PLACEMENT_V16,
         "obstacle_lateral_choices": [0.0, 1.0],  # GT用边缘障碍
         "obstacle_randomize_non_lane_pid_yaw": False,  # 车头沿赛道progress切向（不随机）
         "obstacle_spawn_ahead_min_m": 5.0,
@@ -236,10 +243,7 @@ CURRICULUM_PHASES: Dict[str, Dict[str, Any]] = {
         "obstacle_progress_min": 0.20,  # GT障碍范围：20%-80%
         "obstacle_progress_max": 0.80,
         "ws_obstacle_free_prob": 0.20,          # 统一：20% 无障碍比例
-        "ws_obstacle_modes": ["static"],         # 从jitter改回static：WS太窄jitter无法绕行
-        "ws_obstacle_progress_min": 0.20,        # WS障碍范围：20%-80%
-        "ws_obstacle_progress_max": 0.80,
-        "ws_obstacle_fixed_lateral_ratio": None,  # 随机边缘放置，给车留绕行空间
+        **WS_SHARED_AVOID_PLACEMENT_V16,
         "obstacle_randomize_non_lane_pid_yaw": False,  # 车头沿赛道切向，不随机转向
         "obstacle_spawn_ahead_min_m": 4.5,
         "obstacle_spawn_ahead_max_m": 12.0,
@@ -260,23 +264,20 @@ CURRICULUM_PHASES: Dict[str, Dict[str, Any]] = {
         "enable_dynamic_scene_weights": True,
         "enable_step_balance_sampling": True,
         "obstacle_enabled": True,
-        "obstacle_count": 2,  # GT 使用两个障碍物；WS 仍由运行时限制为单障碍
+        "obstacle_count": 1,  # PID阶段GT仅保留1台lane_pid障碍；WS仍由运行时限制为单障碍
         "obstacle_free_prob": 0.20,
-        "obstacle_modes": ["static", "lane_pid"],
+        "obstacle_modes": ["lane_pid"],
         "obstacle_progress_min": 0.20,  # GT障碍范围：20%-80%
         "obstacle_progress_max": 0.80,
         "ws_obstacle_free_prob": 0.20,
-        "ws_obstacle_modes": ["static"],          # 修复：WS太窄jitter无法绕行，改回static
-        "ws_obstacle_progress_min": 0.20,  # WS障碍范围：20%-80%
-        "ws_obstacle_progress_max": 0.80,
-        "ws_obstacle_fixed_lateral_ratio": None,  # 修复：随机边缘放置
+        **WS_SHARED_AVOID_PLACEMENT_V16,
         "obstacle_randomize_non_lane_pid_yaw": False,  # 车头沿赛道切向，不随机转向
         "obstacle_spawn_ahead_min_m": 4.0,
         "obstacle_spawn_ahead_max_m": 11.0,
         "obstacle_min_agent_planar_dist_m": 1.5,
         "obstacle_min_agent_arc_dist_m": 3.8,
-        "obstacle_lane_pid_speed_gt": 0.70,
-        "obstacle_lane_pid_speed_ws": 0.55,
+        "obstacle_lane_pid_speed_gt": 0.30,
+        "obstacle_lane_pid_speed_ws": 0.30,
         "collision_penalty_base": 8.0,
         "offtrack_penalty_base": 5.0,
         "w_near_collision": 0.24,
@@ -292,29 +293,31 @@ CURRICULUM_PHASES: Dict[str, Dict[str, Any]] = {
         "enable_dynamic_scene_weights": True,
         "enable_step_balance_sampling": True,
         "obstacle_enabled": True,
-        "obstacle_count": 2,  # GT 使用两个障碍物；WS 仍由运行时限制为单障碍
-        "obstacle_free_prob": 0.20,
-        "obstacle_modes": ["static", "jitter", "nudge", "lane_pid"],
-        "obstacle_progress_min": 0.20,  # GT障碍范围：20%-80%
-        "obstacle_progress_max": 0.80,
-        "ws_obstacle_free_prob": 0.20,
-        "ws_obstacle_modes": ["static"],          # 修复：WS太窄jitter无法绕行，改回static
-        "ws_obstacle_progress_min": 0.20,  # WS障碍范围：20%-80%
-        "ws_obstacle_progress_max": 0.80,
-        "ws_obstacle_fixed_lateral_ratio": None,  # 修复：随机边缘放置
+        "obstacle_count": 2,  # GT: 双 lane_pid 车；WS 仍由运行时限制为单障碍
+        "obstacle_free_prob": 0.10,
+        "obstacle_modes": ["lane_pid"],
+        "obstacle_fixed_progress_ratio": None,
+        "obstacle_fixed_progress_gap": None,
+        "obstacle_fixed_progress_gap_min": 0.40,  # GT: 第二台与第一台间隔 40%-50% progress
+        "obstacle_fixed_progress_gap_max": 0.50,
+        "obstacle_fixed_lateral_ratio": 0.50,    # GT: 双车都走赛道中线
+        "obstacle_progress_min": 0.15,  # GT 第一台范围：15%-40%
+        "obstacle_progress_max": 0.40,
+        "ws_obstacle_free_prob": 0.10,
+        **WS_SHARED_AVOID_PLACEMENT_V16,
         "obstacle_randomize_non_lane_pid_yaw": False,  # 车头沿赛道切向，不随机转向
         "obstacle_spawn_ahead_min_m": 4.0,
         "obstacle_spawn_ahead_max_m": 10.0,
         "obstacle_min_agent_planar_dist_m": 1.5,
         "obstacle_min_agent_arc_dist_m": 3.5,
-        "obstacle_lane_pid_speed_gt": 0.85,
+        "obstacle_lane_pid_speed_gt": 0.70,
         "obstacle_lane_pid_speed_ws": 0.70,
         "collision_penalty_base": 8.0,
         "offtrack_penalty_base": 5.0,
         "w_near_collision": 0.24,
         "near_collision_start_ratio": 0.60,
         # 步数预算补偿配置
-        "obstacle_target_ratios": {"ws": 0.80, "gt": 0.80},  # 统一：80% 有障碍 / 20% 无障碍
+        "obstacle_target_ratios": {"ws": 0.90, "gt": 0.90},  # 90% 有障碍 / 10% 无障碍
         "window_episode_count": 50,
         "max_compensation_ratio": 0.25,
     },
@@ -406,6 +409,9 @@ TRAIN_V16_DEFAULTS: Dict[str, Any] = {
     "obstacle_min_agent_planar_dist_m": 1.5,
     "obstacle_min_agent_arc_dist_m": 3.5,
     "obstacle_fixed_progress_ratio": None,
+    "obstacle_fixed_progress_gap": None,
+    "obstacle_fixed_progress_gap_min": None,
+    "obstacle_fixed_progress_gap_max": None,
     "obstacle_progress_min": None,
     "obstacle_progress_max": None,
     "obstacle_fixed_lateral_ratio": None,
@@ -476,6 +482,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         recent_episodes: int = 20,
         min_success_episodes: int = 12,
         min_soft_laps: float = 2.0,
+        min_episode_len: Optional[int] = None,
+        min_progress_ratio_forward_sum: Optional[float] = None,
+        min_reward: Optional[float] = None,
+        max_episode_speed_mean: Optional[float] = None,
+        max_episode_speed_max: Optional[float] = None,
+        require_no_stuck_for_success: bool = True,
         max_collision_rate_by_key: Optional[Dict[str, float]] = None,
         max_stage_timesteps: Optional[int] = None,
         save_dir: Optional[str] = None,
@@ -490,6 +502,22 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         self.recent_episodes = max(1, int(recent_episodes))
         self.min_success_episodes = max(1, int(min_success_episodes))
         self.min_soft_laps = float(max(0.0, min_soft_laps))
+        self.min_episode_len = (
+            None if min_episode_len is None else max(1, int(min_episode_len))
+        )
+        self.min_progress_ratio_forward_sum = (
+            None
+            if min_progress_ratio_forward_sum is None
+            else max(0.0, float(min_progress_ratio_forward_sum))
+        )
+        self.min_reward = None if min_reward is None else float(min_reward)
+        self.max_episode_speed_mean = (
+            None if max_episode_speed_mean is None else max(0.0, float(max_episode_speed_mean))
+        )
+        self.max_episode_speed_max = (
+            None if max_episode_speed_max is None else max(0.0, float(max_episode_speed_max))
+        )
+        self.require_no_stuck_for_success = bool(require_no_stuck_for_success)
         self.max_collision_rate_by_key: Dict[str, float] = {}
         for key, limit in dict(max_collision_rate_by_key or {}).items():
             key_s = str(key)
@@ -510,6 +538,9 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         self.recent_soft_laps: Dict[str, deque] = {
             key: deque(maxlen=self.recent_episodes) for key in self.required_logging_keys
         }
+        self.recent_gate_success: Dict[str, deque] = {
+            key: deque(maxlen=self.recent_episodes) for key in self.required_logging_keys
+        }
         self.recent_term_collisions: Dict[str, deque] = {
             key: deque(maxlen=self.recent_episodes) for key in self.required_logging_keys
         }
@@ -523,14 +554,17 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
     def _recover_resume_state(
         self,
         current_num_timesteps: int,
-    ) -> Tuple[Optional[int], Dict[str, deque], Dict[str, deque]]:
+    ) -> Tuple[Optional[int], Dict[str, deque], Dict[str, deque], Dict[str, deque]]:
         if not self.save_dir:
-            return None, {}, {}
+            return None, {}, {}, {}
         log_path = os.path.join(self.save_dir, self.filename)
         if not os.path.isfile(log_path):
-            return None, {}, {}
+            return None, {}, {}, {}
 
         recovered_soft_laps: Dict[str, deque] = {
+            key: deque(maxlen=self.recent_episodes) for key in self.required_logging_keys
+        }
+        recovered_gate_success: Dict[str, deque] = {
             key: deque(maxlen=self.recent_episodes) for key in self.required_logging_keys
         }
         recovered_term_collisions: Dict[str, deque] = {
@@ -573,6 +607,10 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                             key: deque(maxlen=self.recent_episodes)
                             for key in self.required_logging_keys
                         }
+                        recovered_gate_success = {
+                            key: deque(maxlen=self.recent_episodes)
+                            for key in self.required_logging_keys
+                        }
                         recovered_term_collisions = {
                             key: deque(maxlen=self.recent_episodes)
                             for key in self.required_logging_keys
@@ -604,14 +642,32 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                         term_collision = 0.0
                     if not np.isfinite(term_collision):
                         term_collision = 0.0
+                    try:
+                        gate_success = float(rec.get("gate_success", np.nan))
+                    except Exception:
+                        gate_success = np.nan
+                    if not np.isfinite(gate_success):
+                        gate_success, _ = self._record_gate_success(
+                            rec,
+                            soft_laps=soft_laps,
+                            term_collision=term_collision,
+                        )
                     recovered_soft_laps[logging_key].append(max(0.0, float(soft_laps)))
+                    recovered_gate_success[logging_key].append(
+                        1.0 if float(gate_success) >= 0.5 else 0.0
+                    )
                     recovered_term_collisions[logging_key].append(
                         1.0 if float(term_collision) >= 0.5 else 0.0
                     )
         except Exception:
-            return None, {}, {}
+            return None, {}, {}, {}
 
-        return stage_start_num_timesteps, recovered_soft_laps, recovered_term_collisions
+        return (
+            stage_start_num_timesteps,
+            recovered_soft_laps,
+            recovered_gate_success,
+            recovered_term_collisions,
+        )
 
     def _window_snapshot(self) -> Dict[str, Any]:
         return {
@@ -619,6 +675,9 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                 "success_count": int(self._window_success_count(key)),
                 "window_size": int(len(self.recent_soft_laps.get(key, []))),
                 "values": [float(x) for x in self.recent_soft_laps.get(key, [])],
+                "gate_success_values": [
+                    float(x) for x in self.recent_gate_success.get(key, [])
+                ],
                 "term_collision_rate": self._window_collision_rate(key),
             }
             for key in self.required_logging_keys
@@ -643,7 +702,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
     def _on_training_start(self) -> None:
         current_num_timesteps = int(getattr(self.model, "num_timesteps", 0))
         self._start_num_timesteps = int(current_num_timesteps)
-        recovered_stage_start, recovered_soft_laps, recovered_term_collisions = (
+        (
+            recovered_stage_start,
+            recovered_soft_laps,
+            recovered_gate_success,
+            recovered_term_collisions,
+        ) = (
             self._recover_resume_state(current_num_timesteps)
         )
         if recovered_stage_start is not None and int(recovered_stage_start) <= int(current_num_timesteps):
@@ -651,6 +715,10 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             for key in self.required_logging_keys:
                 self.recent_soft_laps[key].clear()
                 self.recent_soft_laps[key].extend(list(recovered_soft_laps.get(key, [])))
+                self.recent_gate_success[key].clear()
+                self.recent_gate_success[key].extend(
+                    list(recovered_gate_success.get(key, []))
+                )
                 self.recent_term_collisions[key].clear()
                 self.recent_term_collisions[key].extend(
                     list(recovered_term_collisions.get(key, []))
@@ -669,6 +737,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     "recent_episodes": int(self.recent_episodes),
                     "min_success_episodes": int(self.min_success_episodes),
                     "min_soft_laps": float(self.min_soft_laps),
+                    "min_episode_len": self.min_episode_len,
+                    "min_progress_ratio_forward_sum": self.min_progress_ratio_forward_sum,
+                    "min_reward": self.min_reward,
+                    "max_episode_speed_mean": self.max_episode_speed_mean,
+                    "max_episode_speed_max": self.max_episode_speed_max,
+                    "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
                     "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
                     "recovered_stage_start_num_timesteps": int(self._start_num_timesteps),
                     "recovered_stage_timesteps": int(self._stage_timesteps()),
@@ -691,6 +765,20 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     for key, limit in self.max_collision_rate_by_key.items()
                 ]
                 collision_txt = ", " + ", ".join(collision_parts)
+            perf_parts = []
+            if self.min_episode_len is not None:
+                perf_parts.append(f"len>={self.min_episode_len}")
+            if self.min_progress_ratio_forward_sum is not None:
+                perf_parts.append(f"progress>={self.min_progress_ratio_forward_sum:.3f}")
+            if self.min_reward is not None:
+                perf_parts.append(f"reward>={self.min_reward:.2f}")
+            if self.max_episode_speed_mean is not None:
+                perf_parts.append(f"speed_mean<={self.max_episode_speed_mean:.3f}")
+            if self.max_episode_speed_max is not None:
+                perf_parts.append(f"speed_max<={self.max_episode_speed_max:.3f}")
+            performance_txt = ""
+            if perf_parts:
+                performance_txt = " or performance(" + ", ".join(perf_parts) + ")"
             inherit_txt = ""
             if self._start_num_timesteps < int(current_num_timesteps):
                 inherit_txt = (
@@ -702,7 +790,7 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                 f"after {self.min_stage_timesteps} stage steps, "
                 f"{joined} recent {self.recent_episodes} eps need "
                 f">= {self.min_success_episodes} eps with soft_lap >= {self.min_soft_laps:.1f}"
-                f"{collision_txt}{max_txt}{inherit_txt}"
+                f"{performance_txt}{collision_txt}{max_txt}{inherit_txt}"
             )
 
     def _stage_timesteps(self) -> int:
@@ -727,10 +815,91 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         return max(0.0, lap_raw / 6.0)
 
     def _window_success_count(self, logging_key: str) -> int:
-        dq = self.recent_soft_laps.get(logging_key)
+        dq = self.recent_gate_success.get(logging_key)
         if dq is None:
             return 0
-        return int(sum(float(v) + 1e-9 >= self.min_soft_laps for v in dq))
+        return int(sum(float(v) >= 0.5 for v in dq))
+
+    @staticmethod
+    def _finite_float(value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if not np.isfinite(out):
+            return float(default)
+        return float(out)
+
+    @staticmethod
+    def _finite_int(value: Any, default: int = 0) -> int:
+        try:
+            out = int(value)
+        except Exception:
+            return int(default)
+        return int(out)
+
+    def _record_gate_success(
+        self,
+        record: Dict[str, Any],
+        soft_laps: float,
+        term_collision: float,
+    ) -> Tuple[float, str]:
+        if float(term_collision) >= 0.5:
+            return 0.0, "collision"
+
+        term_stuck = self._finite_float(record.get("ep_term_stuck", 0.0), 0.0)
+        if self.require_no_stuck_for_success and term_stuck >= 0.5:
+            return 0.0, "stuck"
+
+        if float(soft_laps) + 1e-9 >= self.min_soft_laps:
+            return 1.0, "soft_lap"
+
+        has_performance_gate = any(
+            value is not None
+            for value in (
+                self.min_episode_len,
+                self.min_progress_ratio_forward_sum,
+                self.min_reward,
+                self.max_episode_speed_mean,
+                self.max_episode_speed_max,
+            )
+        )
+        if not has_performance_gate:
+            return 0.0, "soft_lap_below_threshold"
+
+        episode_len = self._finite_int(record.get("episode_len", 0), 0)
+        if self.min_episode_len is not None and episode_len < self.min_episode_len:
+            return 0.0, "episode_len_below_threshold"
+
+        progress = self._finite_float(
+            record.get("ep_progress_ratio_forward_sum", 0.0),
+            0.0,
+        )
+        if (
+            self.min_progress_ratio_forward_sum is not None
+            and progress + 1e-9 < self.min_progress_ratio_forward_sum
+        ):
+            return 0.0, "progress_below_threshold"
+
+        reward = self._finite_float(record.get("episode_reward", 0.0), 0.0)
+        if self.min_reward is not None and reward + 1e-9 < self.min_reward:
+            return 0.0, "reward_below_threshold"
+
+        speed_mean = self._finite_float(record.get("ep_speed_mean", 0.0), 0.0)
+        if (
+            self.max_episode_speed_mean is not None
+            and speed_mean > self.max_episode_speed_mean + 1e-9
+        ):
+            return 0.0, "speed_mean_above_real_envelope"
+
+        speed_max = self._finite_float(record.get("ep_speed_max", 0.0), 0.0)
+        if (
+            self.max_episode_speed_max is not None
+            and speed_max > self.max_episode_speed_max + 1e-9
+        ):
+            return 0.0, "speed_max_above_real_envelope"
+
+        return 1.0, "performance"
 
     @staticmethod
     def _extract_term_collision(info: Dict[str, Any]) -> float:
@@ -783,6 +952,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             "recent_episodes": int(self.recent_episodes),
             "min_success_episodes": int(self.min_success_episodes),
             "min_soft_laps": float(self.min_soft_laps),
+            "min_episode_len": self.min_episode_len,
+            "min_progress_ratio_forward_sum": self.min_progress_ratio_forward_sum,
+            "min_reward": self.min_reward,
+            "max_episode_speed_mean": self.max_episode_speed_mean,
+            "max_episode_speed_max": self.max_episode_speed_max,
+            "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
             "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
             "stop_num_timesteps": int(self.stop_num_timesteps),
             "stop_stage_timesteps": int(self.stop_stage_timesteps),
@@ -796,6 +971,10 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             },
             "recent_soft_laps": {
                 key: [float(x) for x in self.recent_soft_laps.get(key, [])]
+                for key in self.required_logging_keys
+            },
+            "recent_gate_success": {
+                key: [float(x) for x in self.recent_gate_success.get(key, [])]
                 for key in self.required_logging_keys
             },
             "recent_term_collisions": {
@@ -821,38 +1000,127 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                 continue
             soft_laps = self._extract_soft_laps(info)
             term_collision = self._extract_term_collision(info)
-            self.recent_soft_laps[logging_key].append(soft_laps)
-            self.recent_term_collisions[logging_key].append(term_collision)
             ep = info.get("episode", {})
-            self._write_event(
-                "episode",
-                {
-                    "logging_key": logging_key,
-                    "scene_key": str(info.get("scene_key", logging_key)),
-                    "domain": str(info.get("domain", "")),
-                    "episode_reward": (
-                        None if "r" not in ep else float(ep.get("r", 0.0))
-                    ),
-                    "episode_len": (
-                        None if "l" not in ep else int(ep.get("l", 0))
-                    ),
-                    "soft_laps": float(soft_laps),
-                    "termination_reason": str(info.get("termination_reason", "")),
-                    "ep_term_collision": float(info.get("ep_term_collision", 0.0) or 0.0),
-                    "ep_term_offtrack": float(info.get("ep_term_offtrack", 0.0) or 0.0),
-                    "ep_term_stuck": float(info.get("ep_term_stuck", 0.0) or 0.0),
-                    "ep_r_progress": float(info.get("ep_r_progress", 0.0) or 0.0),
-                    "ep_r_near_collision": float(info.get("ep_r_near_collision", 0.0) or 0.0),
-                    "ep_r_near_offtrack": float(info.get("ep_r_near_offtrack", 0.0) or 0.0),
-                    "ep_r_collision": float(info.get("ep_r_collision", 0.0) or 0.0),
-                    "ep_r_total": float(info.get("ep_r_total", 0.0) or 0.0),
-                    "ep_cte_abs_p90": float(info.get("ep_cte_abs_p90", 0.0) or 0.0),
-                    "ep_progress_ratio_forward_sum": float(
-                        info.get("ep_progress_ratio_forward_sum", 0.0) or 0.0
-                    ),
-                    "window": self._window_snapshot(),
-                },
+            gate_record = {
+                "episode_reward": ep.get("r", 0.0),
+                "episode_len": ep.get("l", 0),
+                "ep_progress_ratio_forward_sum": info.get("ep_progress_ratio_forward_sum", 0.0),
+                "ep_term_stuck": info.get("ep_term_stuck", 0.0),
+                "ep_speed_mean": info.get("ep_speed_mean", 0.0),
+                "ep_speed_max": info.get("ep_speed_max", 0.0),
+            }
+            gate_success, gate_success_reason = self._record_gate_success(
+                gate_record,
+                soft_laps=soft_laps,
+                term_collision=term_collision,
             )
+            self.recent_soft_laps[logging_key].append(soft_laps)
+            self.recent_gate_success[logging_key].append(gate_success)
+            self.recent_term_collisions[logging_key].append(term_collision)
+            episode_payload = {
+                "logging_key": logging_key,
+                "scene_key": str(info.get("scene_key", logging_key)),
+                "domain": str(info.get("domain", "")),
+                "episode_reward": (
+                    None if "r" not in ep else float(ep.get("r", 0.0))
+                ),
+                "episode_len": (
+                    None if "l" not in ep else int(ep.get("l", 0))
+                ),
+                "soft_laps": float(soft_laps),
+                "gate_success": float(gate_success),
+                "gate_success_reason": str(gate_success_reason),
+                "termination_reason": str(info.get("termination_reason", "")),
+                "ep_term_collision": float(info.get("ep_term_collision", 0.0) or 0.0),
+                "ep_term_offtrack": float(info.get("ep_term_offtrack", 0.0) or 0.0),
+                "ep_term_stuck": float(info.get("ep_term_stuck", 0.0) or 0.0),
+                "ep_r_progress": float(info.get("ep_r_progress", 0.0) or 0.0),
+                "ep_r_near_collision": float(info.get("ep_r_near_collision", 0.0) or 0.0),
+                "ep_r_near_offtrack": float(info.get("ep_r_near_offtrack", 0.0) or 0.0),
+                "ep_r_collision": float(info.get("ep_r_collision", 0.0) or 0.0),
+                "ep_r_total": float(info.get("ep_r_total", 0.0) or 0.0),
+                "obstacle_episode_modes": str(info.get("obstacle_episode_modes", "")),
+                "obstacle_primary_mode": str(info.get("obstacle_primary_mode", "")),
+                "ep_obstacle_has_lane_pid": float(info.get("ep_obstacle_has_lane_pid", 0.0) or 0.0),
+                "ep_obstacle_primary_is_lane_pid": float(
+                    info.get("ep_obstacle_primary_is_lane_pid", 0.0) or 0.0
+                ),
+                "ep_obstacle_static_count": float(info.get("ep_obstacle_static_count", 0.0) or 0.0),
+                "ep_obstacle_jitter_count": float(info.get("ep_obstacle_jitter_count", 0.0) or 0.0),
+                "ep_obstacle_nudge_count": float(info.get("ep_obstacle_nudge_count", 0.0) or 0.0),
+                "ep_obstacle_lane_pid_count": float(info.get("ep_obstacle_lane_pid_count", 0.0) or 0.0),
+                "ep_lane_pid_debug_steps": float(info.get("ep_lane_pid_debug_steps", 0.0) or 0.0),
+                "ep_lane_pid_target_speed_mean": float(
+                    info.get("ep_lane_pid_target_speed_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_speed_mean": float(info.get("ep_lane_pid_speed_mean", 0.0) or 0.0),
+                "ep_lane_pid_speed_error_abs_mean": float(
+                    info.get("ep_lane_pid_speed_error_abs_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_effective_lookahead_mean": float(
+                    info.get("ep_lane_pid_effective_lookahead_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_local_forward_mean": float(
+                    info.get("ep_lane_pid_local_forward_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_local_left_abs_mean": float(
+                    info.get("ep_lane_pid_local_left_abs_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_lat_err_norm_abs_mean": float(
+                    info.get("ep_lane_pid_lat_err_norm_abs_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_steer_abs_mean": float(
+                    info.get("ep_lane_pid_steer_abs_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_throttle_mean": float(
+                    info.get("ep_lane_pid_throttle_mean", 0.0) or 0.0
+                ),
+                "ep_lane_pid_reverse_rate": float(
+                    info.get("ep_lane_pid_reverse_rate", 0.0) or 0.0
+                ),
+                "ep_cte_abs_p90": float(info.get("ep_cte_abs_p90", 0.0) or 0.0),
+                "ep_progress_ratio_forward_sum": float(
+                    info.get("ep_progress_ratio_forward_sum", 0.0) or 0.0
+                ),
+                "ep_speed_mean": float(info.get("ep_speed_mean", 0.0) or 0.0),
+                "ep_speed_min": float(info.get("ep_speed_min", 0.0) or 0.0),
+                "ep_speed_max": float(info.get("ep_speed_max", 0.0) or 0.0),
+                "window": self._window_snapshot(),
+            }
+            for key in (
+                "ep_r_wait_window",
+                "ep_r_force_pass",
+                "ep_r_unsafe_close",
+                "ep_r_obstacle_clearance",
+                "ep_r_overtake",
+                "ep_r_post_pass",
+                "ep_r_post_pass_cut_in",
+                "ep_overtake_count",
+                "ep_post_pass_stability_count",
+                "ep_pass_window_valid_rate",
+                "ep_invalid_window_close_rate",
+                "ep_unsafe_close_rate",
+                "ep_obstacle_clearance_band_rate",
+                "ep_obstacle_clearance_critical_rate",
+                "ep_obstacle_clearance_risk_mean",
+                "ep_obstacle_planar_distance_min",
+                "ep_post_pass_watch_rate",
+                "ep_post_pass_cut_in_rate",
+                "ep_post_pass_cut_in_risk_mean",
+                "ep_post_pass_planar_distance_min",
+                "ep_post_pass_terminal_collision",
+                "ep_overtake_success_ready_rate",
+                "ep_overtake_passed_longitudinal_rate",
+                "ep_overtake_success_clearance_ok_rate",
+                "ep_overtake_success_candidate_rate",
+                "ep_overtake_success_blocked_clearance_rate",
+                "ep_overtake_success_blocked_progress_rate",
+                "ep_overtake_success_blocked_safety_rate",
+                "ep_overtake_success_grant_count",
+            ):
+                if key in info:
+                    episode_payload[key] = float(info.get(key, 0.0) or 0.0)
+            self._write_event("episode", episode_payload)
 
         stage_timesteps = self._stage_timesteps()
         if stage_timesteps >= self.min_stage_timesteps and self._all_recent_windows_ready():
@@ -1212,6 +1480,9 @@ def train_v16(
     obstacle_min_separation_world: float = 3.0,
     obstacle_lateral_choices: Optional[List[float]] = None,
     obstacle_fixed_progress_ratio: Optional[float] = None,
+    obstacle_fixed_progress_gap: Optional[float] = None,
+    obstacle_fixed_progress_gap_min: Optional[float] = None,
+    obstacle_fixed_progress_gap_max: Optional[float] = None,
     obstacle_progress_min: Optional[float] = None,
     obstacle_progress_max: Optional[float] = None,
     obstacle_fixed_lateral_ratio: Optional[float] = None,
@@ -1256,6 +1527,7 @@ def train_v16(
     auto_lr_cooldown_checks: int = 15,
     auto_lr_warmup_steps: int = 250000,
     auto_lr_best_window: int = 50,
+    sim2real_json: Optional[str] = None,
     extra_callbacks: Optional[List[BaseCallback]] = None,
     extra_run_metadata: Optional[Dict[str, Any]] = None,
     config_filename: str = "v16_config.json",
@@ -1282,6 +1554,9 @@ def train_v16(
         "obstacle_min_agent_planar_dist_m": obstacle_min_agent_planar_dist_m,
         "obstacle_min_agent_arc_dist_m": obstacle_min_agent_arc_dist_m,
         "obstacle_fixed_progress_ratio": obstacle_fixed_progress_ratio,
+        "obstacle_fixed_progress_gap": obstacle_fixed_progress_gap,
+        "obstacle_fixed_progress_gap_min": obstacle_fixed_progress_gap_min,
+        "obstacle_fixed_progress_gap_max": obstacle_fixed_progress_gap_max,
         "obstacle_progress_min": obstacle_progress_min,
         "obstacle_progress_max": obstacle_progress_max,
         "obstacle_fixed_lateral_ratio": obstacle_fixed_lateral_ratio,
@@ -1314,6 +1589,9 @@ def train_v16(
     obstacle_min_agent_planar_dist_m = curriculum_values["obstacle_min_agent_planar_dist_m"]
     obstacle_min_agent_arc_dist_m = curriculum_values["obstacle_min_agent_arc_dist_m"]
     obstacle_fixed_progress_ratio = curriculum_values["obstacle_fixed_progress_ratio"]
+    obstacle_fixed_progress_gap = curriculum_values["obstacle_fixed_progress_gap"]
+    obstacle_fixed_progress_gap_min = curriculum_values.get("obstacle_fixed_progress_gap_min", None)
+    obstacle_fixed_progress_gap_max = curriculum_values.get("obstacle_fixed_progress_gap_max", None)
     obstacle_progress_min = curriculum_values.get("obstacle_progress_min", None)
     obstacle_progress_max = curriculum_values.get("obstacle_progress_max", None)
     obstacle_fixed_lateral_ratio = curriculum_values["obstacle_fixed_lateral_ratio"]
@@ -1598,6 +1876,9 @@ def train_v16(
             obstacle_min_separation_world=obstacle_min_separation_world,
             obstacle_lateral_choices=obstacle_lateral_choices,
             obstacle_fixed_progress_ratio=obstacle_fixed_progress_ratio,
+            obstacle_fixed_progress_gap=obstacle_fixed_progress_gap,
+            obstacle_fixed_progress_gap_min=obstacle_fixed_progress_gap_min,
+            obstacle_fixed_progress_gap_max=obstacle_fixed_progress_gap_max,
             obstacle_progress_min=obstacle_progress_min,
             obstacle_progress_max=obstacle_progress_max,
             obstacle_fixed_lateral_ratio=obstacle_fixed_lateral_ratio,
@@ -1620,6 +1901,7 @@ def train_v16(
             obstacle_seed=obstacle_seed,
             ego_random_spawn=ego_random_spawn,
             ego_spawn_lateral_ratio=ego_spawn_lateral_ratio,
+            sim2real_json=sim2real_json,
         )
 
     env = DummyVecEnv([make_env])
@@ -1780,6 +2062,9 @@ def train_v16(
             "min_agent_arc_dist_m": obstacle_min_agent_arc_dist_m,
             "min_separation_world": obstacle_min_separation_world,
             "fixed_progress_ratio": obstacle_fixed_progress_ratio,
+            "fixed_progress_gap": obstacle_fixed_progress_gap,
+            "fixed_progress_gap_min": obstacle_fixed_progress_gap_min,
+            "fixed_progress_gap_max": obstacle_fixed_progress_gap_max,
             "progress_min": obstacle_progress_min,
             "progress_max": obstacle_progress_max,
             "fixed_lateral_ratio": obstacle_fixed_lateral_ratio,
@@ -2096,13 +2381,14 @@ def main() -> None:
     parser.add_argument("--disable-obstacles", action="store_true", default=False)
     parser.add_argument("--obstacle-count", type=int, default=2)
     parser.add_argument("--obstacle-free-prob", type=float, default=0.15)
-    parser.add_argument("--obstacle-modes", nargs="+", default=["static", "jitter"])
+    parser.add_argument("--obstacle-modes", nargs="+", default=None)
     parser.add_argument("--obstacle-spawn-ahead-min-m", type=float, default=3.5)
     parser.add_argument("--obstacle-spawn-ahead-max-m", type=float, default=14.0)
     parser.add_argument("--obstacle-min-agent-planar-dist-m", type=float, default=1.5)
     parser.add_argument("--obstacle-min-agent-arc-dist-m", type=float, default=3.5)
     parser.add_argument("--obstacle-min-separation-world", type=float, default=3.0)
     parser.add_argument("--obstacle-fixed-progress-ratio", type=float, default=None)
+    parser.add_argument("--obstacle-fixed-progress-gap", type=float, default=None)
     parser.add_argument("--obstacle-progress-min", type=float, default=None)
     parser.add_argument("--obstacle-progress-max", type=float, default=None)
     parser.add_argument("--obstacle-fixed-lateral-ratio", type=float, default=None)
@@ -2119,6 +2405,10 @@ def main() -> None:
     parser.add_argument("--obstacle-seed", type=int, default=None)
     parser.add_argument("--ego-random-spawn", action="store_true", default=False)
     parser.add_argument("--ego-spawn-lateral-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--sim2real-json", type=str, default=None,
+        help="Path to dynamics_alignment_wm.json for sim2real throttle/steer scaling",
+    )
 
     args = parser.parse_args()
 
@@ -2161,6 +2451,7 @@ def main() -> None:
         obstacle_min_agent_arc_dist_m=args.obstacle_min_agent_arc_dist_m,
         obstacle_min_separation_world=args.obstacle_min_separation_world,
         obstacle_fixed_progress_ratio=args.obstacle_fixed_progress_ratio,
+        obstacle_fixed_progress_gap=args.obstacle_fixed_progress_gap,
         obstacle_progress_min=args.obstacle_progress_min,
         obstacle_progress_max=args.obstacle_progress_max,
         obstacle_fixed_lateral_ratio=args.obstacle_fixed_lateral_ratio,
@@ -2177,6 +2468,7 @@ def main() -> None:
         obstacle_seed=args.obstacle_seed,
         ego_random_spawn=args.ego_random_spawn,
         ego_spawn_lateral_ratio=args.ego_spawn_lateral_ratio,
+        sim2real_json=args.sim2real_json,
         seed=args.seed,
         exp_tag=args.exp_tag,
         resume_latest=args.resume_latest,
