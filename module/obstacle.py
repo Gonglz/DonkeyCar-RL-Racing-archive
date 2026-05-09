@@ -73,6 +73,7 @@ _ENV_TO_SCENE_KEY: Dict[str, str] = {
 
 _UNITY_WORLD_SCALE = 8.0
 _DEFAULT_WORLD_Y = 0.5
+_WS_HIDDEN_WORLD_Y = -500.0
 _DEFAULT_TRACK_PROFILE_DIR = MODULE_TRACK_DATA_DIR
 # Fixed obstacle color aligned to the real obstacle-car appearance.
 _FIXED_OBSTACLE_BODY_RGB: Tuple[int, int, int] = (255, 105, 180)
@@ -219,6 +220,8 @@ class LanePIDConfig:
     target_speed: float
     lateral_ratio: float = 0.5
     lookahead_m: float = 0.9
+    obstacle_radius: float = 0.25
+    safety_margin: float = 0.05
     pure_pursuit_gain: float = 1.0
     lookahead_speed_gain: float = 0.8
     recovery_steer_gain: float = 1.1
@@ -778,6 +781,7 @@ class DonkeyObstacleCar:
         self,
         reset_on_spawn: bool = False,
         hidden_pose: Optional[Tuple[float, float, float]] = None,
+        hidden_world_y: Optional[float] = None,
         hold_brake: bool = True,
     ) -> None:
         """连接到同一个 DonkeySim server，并创建障碍车 client。"""
@@ -804,7 +808,7 @@ class DonkeyObstacleCar:
                 x=float(hidden_x),
                 z=float(hidden_z),
                 yaw_deg=float(hidden_yaw_deg),
-                world_y=self.default_world_y,
+                world_y=self.default_world_y if hidden_world_y is None else float(hidden_world_y),
                 hold_brake=hold_brake,
             )
         self._stop_evt.clear()
@@ -1040,6 +1044,8 @@ class DonkeyObstacleCar:
                 target_speed=float(max(target_speed, 0.0)),
                 lateral_ratio=float(anchor.lateral_ratio if lateral_ratio is None else lateral_ratio),
                 lookahead_m=float(max(lookahead_m, 0.1)),
+                obstacle_radius=float(max(obstacle_radius, 0.0)),
+                safety_margin=float(max(safety_margin, 0.0)),
                 pure_pursuit_gain=float(max(steer_kp, 0.0)),
                 lookahead_speed_gain=float(max(steer_lat_gain, 0.0)),
                 recovery_steer_gain=float(max(0.6 * max(steer_kp, 0.0) + 0.4, 0.0)),
@@ -1889,6 +1895,8 @@ class DonkeyObstacleCar:
             scene_key=self.scene_key,
             progress_ratio=progress_ratio + effective_lookahead / max(float(g.loop_len), 1e-6),
             lateral_ratio=float(cfg.lateral_ratio),
+            obstacle_radius=float(cfg.obstacle_radius),
+            safety_margin=float(cfg.safety_margin),
         )
         dx = float(lookahead_target.x - pose.x)
         dz = float(lookahead_target.z - pose.z)
@@ -1965,6 +1973,7 @@ def spawn_preset_obstacle_fleet(
     spawn_gap: float = 0.0,
     placement_timeout_s: float = 1.5,
     initial_place: bool = True,
+    hidden_world_y: Optional[float] = None,
 ) -> DonkeyObstacleFleet:
     """
     生成一组静态障碍车。
@@ -2017,6 +2026,9 @@ def spawn_preset_obstacle_fleet(
         raise ValueError("body_rgbs cannot be empty")
 
     cars: List[DonkeyObstacleCar] = []
+    spawn_hidden_world_y = hidden_world_y
+    if spawn_hidden_world_y is None and preset.name == "ws":
+        spawn_hidden_world_y = _WS_HIDDEN_WORLD_Y
     try:
         for i, target in enumerate(targets, start=1):
             color = tuple(int(v) for v in body_rgbs[(i - 1) % len(body_rgbs)])
@@ -2040,6 +2052,7 @@ def spawn_preset_obstacle_fleet(
             car.spawn(
                 reset_on_spawn=False,
                 hidden_pose=(staging_x, float(preset.staging_z), 0.0),
+                hidden_world_y=spawn_hidden_world_y,
                 hold_brake=hold_brake,
             )
             cars.append(car)

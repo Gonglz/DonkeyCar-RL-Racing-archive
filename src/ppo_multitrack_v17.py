@@ -673,19 +673,28 @@ _V17_STAGE_GATE_OVERRIDES = {
         "min_stage_timesteps": 180_000,
         "max_stage_timesteps": 520_000,
         "min_success_episodes": 3,
+        "required_obstacle_mode_for_gate": "lane_pid",
         "max_collision_rate_by_key": {"ws": 0.25, "gt": 0.35},
+        "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
+        "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
     },
     "lane_pid_mid": {
         "min_stage_timesteps": 220_000,
         "max_stage_timesteps": 560_000,
         "min_success_episodes": 3,
+        "required_obstacle_mode_for_gate": "lane_pid",
         "max_collision_rate_by_key": {"ws": 0.18, "gt": 0.25},
+        "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
+        "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
     },
     "lane_pid_full": {
         "min_stage_timesteps": 240_000,
         "max_stage_timesteps": 620_000,
         "min_success_episodes": 3,
+        "required_obstacle_mode_for_gate": "lane_pid",
         "max_collision_rate_by_key": {"ws": 0.20, "gt": 0.30},
+        "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
+        "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
     },
 }
 AUTO_CURRICULUM_STAGES = tuple(
@@ -2510,6 +2519,7 @@ def train_v17_auto_curriculum(
                 min_reward=stage_def.get("min_reward"),
                 max_episode_speed_mean=stage_def.get("max_episode_speed_mean"),
                 max_episode_speed_max=stage_def.get("max_episode_speed_max"),
+                required_obstacle_mode=stage_def.get("required_obstacle_mode_for_gate"),
                 max_collision_rate_by_key=stage_def.get("max_collision_rate_by_key"),
                 max_obstacle_clearance_critical_rate_by_key=stage_def.get(
                     "max_obstacle_clearance_critical_rate_by_key"

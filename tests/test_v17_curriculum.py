@@ -1,7 +1,17 @@
+import math
 import unittest
 from pathlib import Path
 
-from module.obstacle import PoseState, compute_relative_state, pose_from_info, sample_track_target
+import numpy as np
+
+from module.obstacle import (
+    DonkeyObstacleCar,
+    ObstacleSnapshot,
+    PoseState,
+    compute_relative_state,
+    pose_from_info,
+    sample_track_target,
+)
 from module.obstacle_runtime import ObstacleRuntimeConfig, ObstacleRuntimeManager
 from module.track import TrackGeometryManager
 from src import ppo_multitrack_v17 as v17
@@ -65,11 +75,62 @@ class _FallbackObstacleCar(_FakeObstacleCar):
         return {}
 
 
+class _UnstableLanePIDObstacleCar(_FakeObstacleCar):
+    def __init__(self, target):
+        super().__init__()
+        self.target = target
+        self.start_lane_pid_calls = []
+        self.reset_calls = []
+
+    def start_lane_pid(self, **kwargs):
+        self.start_lane_pid_calls.append(dict(kwargs))
+        return self.target
+
+    def reset(self, reason="manual"):
+        self.reset_calls.append(reason)
+
+    def get_obstacle_pose(self):
+        return PoseState(
+            x=float(self.target.x),
+            y=-3.0,
+            z=float(self.target.z),
+            yaw_deg=float(self.target.yaw_deg),
+            speed=195.0,
+            cte=0.0,
+            hit="none",
+            progress_ratio=float(self.target.progress_ratio),
+        )
+
+    def debug_state(self):
+        return {}
+
+
+class _TargetErrorLanePIDObstacleCar(_UnstableLanePIDObstacleCar):
+    def get_obstacle_pose(self):
+        return PoseState(
+            x=float(self.target.x + 1.0),
+            y=0.08,
+            z=float(self.target.z),
+            yaw_deg=float(self.target.yaw_deg),
+            speed=0.0,
+            cte=0.0,
+            hit="none",
+            progress_ratio=float(self.target.progress_ratio),
+        )
+
+
 class _FakeFleet:
     preset = _FakePreset()
 
     def __init__(self, cars):
         self.cars = cars
+        self.shutdown_calls = 0
+
+    def last_errors(self):
+        return [None for _ in self.cars]
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
 
 class V17CurriculumTests(unittest.TestCase):
@@ -114,6 +175,66 @@ class V17CurriculumTests(unittest.TestCase):
             stage["max_obstacle_clearance_band_rate_by_key"],
             {"ws": 0.05, "gt": 0.05},
         )
+
+    def test_lane_pid_stages_keep_clearance_gate_limits(self):
+        for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
+            stage = next(
+                stage for stage in v17.AUTO_CURRICULUM_STAGES
+                if stage["stage_name"] == stage_name
+            )
+            self.assertEqual(
+                stage["max_obstacle_clearance_critical_rate_by_key"],
+                {"ws": 0.0, "gt": 0.0},
+                stage_name,
+            )
+            self.assertEqual(
+                stage["max_obstacle_clearance_band_rate_by_key"],
+                {"ws": 0.05, "gt": 0.05},
+                stage_name,
+            )
+
+    def test_lane_pid_stages_require_lane_pid_obstacle_for_gate(self):
+        for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
+            stage = next(
+                stage for stage in v17.AUTO_CURRICULUM_STAGES
+                if stage["stage_name"] == stage_name
+            )
+            self.assertEqual(stage["required_obstacle_mode_for_gate"], "lane_pid", stage_name)
+
+    def test_lane_pid_gate_rejects_soft_lap_without_lane_pid_obstacle(self):
+        callback = v17.CurriculumWindowAdvanceCallback(
+            stage_name="lane_pid_intro",
+            required_logging_keys=["ws"],
+            min_stage_timesteps=0,
+            recent_episodes=10,
+            min_success_episodes=1,
+            min_soft_laps=2.0,
+            required_obstacle_mode="lane_pid",
+        )
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                "logging_key": "ws",
+                "episode_reward": 100.0,
+                "episode_len": 500,
+                "ep_obstacle_has_lane_pid": 0.0,
+            },
+            soft_laps=3.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (0.0, "required_lane_pid_obstacle_missing"))
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                "logging_key": "ws",
+                "episode_reward": 100.0,
+                "episode_len": 500,
+                "ep_obstacle_has_lane_pid": 1.0,
+            },
+            soft_laps=3.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (1.0, "soft_lap"))
 
     def test_clearance_gate_rejects_soft_lap_with_close_obstacle(self):
         callback = v17.CurriculumWindowAdvanceCallback(
@@ -246,6 +367,212 @@ class V17CurriculumTests(unittest.TestCase):
         self.assertTrue(targets)
         self.assertTrue(all(target.lateral_ratio in (0.0, 1.0) for target in targets))
 
+    def test_ws_lane_pid_lookahead_preserves_start_clearance_for_edge_lateral(self):
+        track_dir = str(Path("module/track_data").resolve())
+        track_geometry = TrackGeometryManager(
+            track_dir=track_dir,
+            env_ids=v17.DEFAULT_ENV_IDS,
+            scene_specs=v17.SCENE_SPECS,
+        )
+        car = DonkeyObstacleCar(
+            env_id="donkey-waveshare-v0",
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            placement_timeout_s=0.1,
+        )
+        anchor = car.start_lane_pid(
+            target_speed=0.5,
+            progress_ratio=0.40,
+            lateral_ratio=0.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+            place_on_start=False,
+        )
+        pose = PoseState(
+            x=anchor.x,
+            y=0.0,
+            z=anchor.z,
+            yaw_deg=anchor.yaw_deg,
+            speed=0.0,
+            cte=0.0,
+            hit="none",
+            progress_ratio=anchor.progress_ratio,
+        )
+
+        car._compute_lane_pid_action(pose, car._lane_pid_cfg)
+        g = track_geometry.scenes["waveshare"]
+        lookahead_progress = anchor.progress_ratio + car._lane_pid_cfg.lookahead_m / g.loop_len
+        expected_edge_target = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=lookahead_progress,
+            lateral_ratio=0.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        default_clipped_target = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=lookahead_progress,
+            lateral_ratio=0.0,
+        )
+        edge_error = math.hypot(
+            float(car._target.x - expected_edge_target.x),
+            float(car._target.z - expected_edge_target.z),
+        )
+        clipped_error = math.hypot(
+            float(car._target.x - default_clipped_target.x),
+            float(car._target.z - default_clipped_target.z),
+        )
+
+        self.assertEqual(anchor.lateral_ratio, 0.0)
+        self.assertEqual(car._target.lateral_ratio, 0.0)
+        self.assertLess(edge_error, 1e-6)
+        self.assertGreater(clipped_error, 0.05)
+
+    def test_ws_lane_pid_watchdog_ignores_lookahead_target_error(self):
+        track_dir = str(Path("module/track_data").resolve())
+        track_geometry = TrackGeometryManager(
+            track_dir=track_dir,
+            env_ids=v17.DEFAULT_ENV_IDS,
+            scene_specs=v17.SCENE_SPECS,
+        )
+        manager = ObstacleRuntimeManager(
+            track_geometry=track_geometry,
+            conf={},
+            track_dir=track_dir,
+            config=ObstacleRuntimeConfig(),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        manager._episode_index = 1
+        manager._active_this_episode = True
+        manager._episode_modes_used = ("lane_pid",)
+        manager._debug_step_count_this_episode = 1
+        manager._fleet = _FakeFleet([_FakeObstacleCar()])
+
+        anchor = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=0.40,
+            lateral_ratio=0.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        g = track_geometry.scenes["waveshare"]
+        lookahead = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=anchor.progress_ratio + 1.2 / g.loop_len,
+            lateral_ratio=anchor.lateral_ratio,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        pose = PoseState(
+            x=anchor.x,
+            y=0.07,
+            z=anchor.z,
+            yaw_deg=anchor.yaw_deg,
+            speed=0.55,
+            cte=0.0,
+            hit="none",
+            progress_ratio=anchor.progress_ratio,
+        )
+        self.assertGreater(
+            ObstacleRuntimeManager._target_error_debug(pose, lookahead)["planar"],
+            0.75,
+        )
+        logs = []
+        manager._log_runtime_debug = lambda event, **fields: logs.append({"event": event, **fields})
+
+        manager._maybe_log_obstacle_watchdog(
+            agent_info={},
+            snapshots=[
+                ObstacleSnapshot(
+                    obstacle=pose,
+                    target=lookahead,
+                    agent=None,
+                    relative=None,
+                )
+            ],
+        )
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["event"], "watchdog")
+        self.assertFalse(logs[0]["anomaly"])
+
+    def test_ws_lane_pid_watchdog_keeps_pose_anomaly_checks(self):
+        track_dir = str(Path("module/track_data").resolve())
+        track_geometry = TrackGeometryManager(
+            track_dir=track_dir,
+            env_ids=v17.DEFAULT_ENV_IDS,
+            scene_specs=v17.SCENE_SPECS,
+        )
+        manager = ObstacleRuntimeManager(
+            track_geometry=track_geometry,
+            conf={},
+            track_dir=track_dir,
+            config=ObstacleRuntimeConfig(),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        manager._episode_index = 1
+        manager._active_this_episode = True
+        manager._episode_modes_used = ("lane_pid",)
+        manager._fleet = _FakeFleet([_FakeObstacleCar()])
+
+        target = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=0.40,
+            lateral_ratio=0.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        cases = [
+            None,
+            PoseState(
+                x=target.x,
+                y=-1.01,
+                z=target.z,
+                yaw_deg=target.yaw_deg,
+                speed=0.55,
+                cte=0.0,
+                hit="none",
+                progress_ratio=target.progress_ratio,
+            ),
+            PoseState(
+                x=target.x,
+                y=0.07,
+                z=target.z,
+                yaw_deg=target.yaw_deg,
+                speed=8.01,
+                cte=0.0,
+                hit="none",
+                progress_ratio=target.progress_ratio,
+            ),
+        ]
+        for idx, pose in enumerate(cases):
+            with self.subTest(idx=idx):
+                manager._debug_step_count_this_episode = 2 + idx
+                manager._debug_last_watch_anomaly_t = 0.0
+                logs = []
+                manager._log_runtime_debug = lambda event, **fields: logs.append({"event": event, **fields})
+
+                manager._maybe_log_obstacle_watchdog(
+                    agent_info={},
+                    snapshots=[
+                        ObstacleSnapshot(
+                            obstacle=pose,
+                            target=target,
+                            agent=None,
+                            relative=None,
+                        )
+                    ],
+                )
+
+                self.assertEqual(len(logs), 1)
+                self.assertEqual(logs[0]["event"], "watchdog")
+                self.assertTrue(logs[0]["anomaly"])
+
     def test_ws_static_layout_retries_edge_after_reset_when_pose_is_unstable(self):
         track_dir = str(Path("module/track_data").resolve())
         track_geometry = TrackGeometryManager(
@@ -295,6 +622,112 @@ class V17CurriculumTests(unittest.TestCase):
         self.assertEqual(car.targets[-1].lateral_ratio, edge_target.lateral_ratio)
         self.assertEqual(manager._episode_target_plan[0].lateral_ratio, car.targets[-1].lateral_ratio)
 
+    def test_ws_lane_pid_layout_parks_when_initial_pose_is_unstable(self):
+        track_dir = str(Path("module/track_data").resolve())
+        track_geometry = TrackGeometryManager(
+            track_dir=track_dir,
+            env_ids=v17.DEFAULT_ENV_IDS,
+            scene_specs=v17.SCENE_SPECS,
+        )
+        manager = ObstacleRuntimeManager(
+            track_geometry=track_geometry,
+            conf={},
+            track_dir=track_dir,
+            config=ObstacleRuntimeConfig(
+                ws_obstacle_count=1,
+                ws_obstacle_modes=("lane_pid",),
+                ws_lateral_choices=(0.0,),
+                placement_timeout_s=0.1,
+                seed=11,
+            ),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        edge_target = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=0.27,
+            lateral_ratio=0.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        car = _UnstableLanePIDObstacleCar(edge_target)
+        manager._fleet = _FakeFleet([car])
+        manager._sample_episode_targets = lambda agent_info, count: [edge_target]
+
+        active = manager._refresh_obstacle_layout(
+            agent_info={
+                "pos": (0.0, 0.0, 0.0),
+                "car": (0.0, 0.0, 0.0),
+                "speed": 0.0,
+                "cte": 0.0,
+                "hit": "none",
+            }
+        )
+
+        self.assertFalse(active)
+        self.assertGreaterEqual(len(car.start_lane_pid_calls), 2)
+        self.assertTrue(car.reset_calls)
+        self.assertEqual(manager._fleet, None)
+        self.assertEqual(len(car.place_pose_calls), 1)
+        self.assertEqual(car.place_pose_calls[0]["world_y"], -500.0)
+        for call in car.start_lane_pid_calls:
+            self.assertEqual(call["lateral_ratio"], 0.0)
+            self.assertEqual(call["obstacle_radius"], 0.0)
+            self.assertEqual(call["safety_margin"], 0.0)
+        self.assertEqual(manager._episode_modes_used, tuple())
+        self.assertEqual(manager._episode_target_plan, tuple())
+
+    def test_ws_lane_pid_layout_rejects_target_error_only_initial_pose(self):
+        track_dir = str(Path("module/track_data").resolve())
+        track_geometry = TrackGeometryManager(
+            track_dir=track_dir,
+            env_ids=v17.DEFAULT_ENV_IDS,
+            scene_specs=v17.SCENE_SPECS,
+        )
+        manager = ObstacleRuntimeManager(
+            track_geometry=track_geometry,
+            conf={},
+            track_dir=track_dir,
+            config=ObstacleRuntimeConfig(
+                ws_obstacle_count=1,
+                ws_obstacle_modes=("lane_pid",),
+                ws_lateral_choices=(1.0,),
+                placement_timeout_s=0.1,
+                seed=12,
+            ),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        edge_target = sample_track_target(
+            track_geometry=track_geometry,
+            scene_key="waveshare",
+            progress_ratio=0.31,
+            lateral_ratio=1.0,
+            obstacle_radius=0.0,
+            safety_margin=0.0,
+        )
+        car = _TargetErrorLanePIDObstacleCar(edge_target)
+        manager._fleet = _FakeFleet([car])
+        manager._sample_episode_targets = lambda agent_info, count: [edge_target]
+
+        active = manager._refresh_obstacle_layout(
+            agent_info={
+                "pos": (0.0, 0.0, 0.0),
+                "car": (0.0, 0.0, 0.0),
+                "speed": 0.0,
+                "cte": 0.0,
+                "hit": "none",
+            }
+        )
+
+        self.assertFalse(active)
+        self.assertGreaterEqual(len(car.start_lane_pid_calls), 2)
+        self.assertTrue(car.reset_calls)
+        self.assertEqual(manager._fleet, None)
+        for call in car.start_lane_pid_calls:
+            self.assertEqual(call["lateral_ratio"], 1.0)
+            self.assertEqual(call["obstacle_radius"], 0.0)
+            self.assertEqual(call["safety_margin"], 0.0)
+
     def test_ws_edge_fallback_does_not_change_lateral(self):
         track_dir = str(Path("module/track_data").resolve())
         track_geometry = TrackGeometryManager(
@@ -326,6 +759,72 @@ class V17CurriculumTests(unittest.TestCase):
 
         self.assertTrue(fallbacks)
         self.assertTrue(all(abs(candidate.lateral_ratio - 0.0) <= 1e-6 for candidate in fallbacks))
+
+    def test_ws_free_episode_does_not_create_or_park_fleet(self):
+        manager = ObstacleRuntimeManager(
+            track_geometry=None,
+            conf={},
+            track_dir="",
+            config=ObstacleRuntimeConfig(
+                enabled=True,
+                active_scene_keys=("waveshare",),
+                ws_obstacle_free_prob=1.0,
+                obstacle_free_prob=1.0,
+                seed=3,
+            ),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        manager._observe_info_only = lambda: {
+            "pos": (0.0, 0.0, -0.963),
+            "car": (0.0, 0.0, 90.0),
+            "speed": 0.0,
+            "cte": 0.0,
+            "hit": "none",
+        }
+        manager._observe_info_and_obs = lambda: (
+            np.zeros((1,), dtype=np.float32),
+            {
+                "pos": (0.0, 0.0, -0.963),
+                "car": (0.0, 0.0, 90.0),
+                "speed": 0.0,
+                "cte": 0.0,
+                "hit": "none",
+            },
+        )
+        ensure_calls = []
+        park_calls = []
+        manager._ensure_fleet = lambda: ensure_calls.append(True)
+        manager._park_fleet = lambda reason="park": park_calls.append(reason)
+        manager._log_reset_debug = lambda **kwargs: None
+
+        manager.on_episode_reset(np.zeros((1,), dtype=np.float32))
+
+        self.assertEqual(ensure_calls, [])
+        self.assertEqual(park_calls, [])
+        self.assertIsNone(manager._fleet)
+
+    def test_ws_deactivation_shutdowns_existing_fleet_instead_of_parking(self):
+        manager = ObstacleRuntimeManager(
+            track_geometry=None,
+            conf={},
+            track_dir="",
+            config=ObstacleRuntimeConfig(),
+        )
+        manager.attach_scene(None, "donkey-waveshare-v0", "waveshare", "ws")
+        fleet = _FakeFleet([_FakeObstacleCar()])
+        manager._fleet = fleet
+        manager._fleet_scene_key = "waveshare"
+        manager._park_fleet = lambda reason="park": (_ for _ in ()).throw(
+            AssertionError("WS inactive deactivation should not park off-map")
+        )
+
+        manager._deactivate_inactive_fleet(reason="random_free_prob")
+
+        self.assertEqual(fleet.shutdown_calls, 1)
+        self.assertEqual(len(fleet.cars[0].place_pose_calls), 1)
+        self.assertEqual(fleet.cars[0].place_pose_calls[0]["world_y"], -500.0)
+        self.assertIsNone(manager._fleet)
+        self.assertEqual(manager._fleet_scene_key, "")
 
     def test_gt_warmup_obstacle_samples_in_front_of_reset_pose(self):
         for phase_name in ("warmup", "warmup_a"):

@@ -488,6 +488,7 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         max_episode_speed_mean: Optional[float] = None,
         max_episode_speed_max: Optional[float] = None,
         require_no_stuck_for_success: bool = True,
+        required_obstacle_mode: Optional[str] = None,
         max_collision_rate_by_key: Optional[Dict[str, float]] = None,
         max_obstacle_clearance_critical_rate_by_key: Optional[Dict[str, float]] = None,
         max_obstacle_clearance_band_rate_by_key: Optional[Dict[str, float]] = None,
@@ -520,6 +521,8 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             None if max_episode_speed_max is None else max(0.0, float(max_episode_speed_max))
         )
         self.require_no_stuck_for_success = bool(require_no_stuck_for_success)
+        required_mode = str(required_obstacle_mode or "").strip().lower()
+        self.required_obstacle_mode = required_mode or None
         self.max_collision_rate_by_key = self._normalize_keyed_rate_limits(
             max_collision_rate_by_key
         )
@@ -764,6 +767,7 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     "max_episode_speed_mean": self.max_episode_speed_mean,
                     "max_episode_speed_max": self.max_episode_speed_max,
                     "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
+                    "required_obstacle_mode": self.required_obstacle_mode,
                     "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
                     "max_obstacle_clearance_critical_rate_by_key": dict(
                         self.max_obstacle_clearance_critical_rate_by_key
@@ -892,6 +896,15 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             or record.get("domain")
             or ""
         )
+        if self.required_obstacle_mode == "lane_pid":
+            has_lane_pid = max(
+                self._finite_float(record.get("ep_obstacle_has_lane_pid", 0.0), 0.0),
+                self._finite_float(record.get("ep_obstacle_lane_pid_count", 0.0), 0.0),
+                self._finite_float(record.get("ep_obstacle_primary_is_lane_pid", 0.0), 0.0),
+            )
+            if has_lane_pid < 0.5:
+                return 0.0, "required_lane_pid_obstacle_missing"
+
         critical_limit = self.max_obstacle_clearance_critical_rate_by_key.get(logging_key)
         if critical_limit is not None:
             critical_rate = self._finite_float(
@@ -1017,6 +1030,7 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             "max_episode_speed_mean": self.max_episode_speed_mean,
             "max_episode_speed_max": self.max_episode_speed_max,
             "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
+            "required_obstacle_mode": self.required_obstacle_mode,
             "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
             "max_obstacle_clearance_critical_rate_by_key": dict(
                 self.max_obstacle_clearance_critical_rate_by_key
@@ -1082,6 +1096,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     "ep_obstacle_clearance_band_rate",
                     0.0,
                 ),
+                "ep_obstacle_has_lane_pid": info.get("ep_obstacle_has_lane_pid", 0.0),
+                "ep_obstacle_primary_is_lane_pid": info.get(
+                    "ep_obstacle_primary_is_lane_pid",
+                    0.0,
+                ),
+                "ep_obstacle_lane_pid_count": info.get("ep_obstacle_lane_pid_count", 0.0),
             }
             gate_success, gate_success_reason = self._record_gate_success(
                 gate_record,

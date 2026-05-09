@@ -194,7 +194,6 @@ class ObstacleRuntimeManager:
             try:
                 if self.config.ego_random_spawn:
                     obs, info = self._randomize_ego_spawn(obs, info)
-                self._ensure_fleet()
                 distribution_sample = self._sample_scene_fixed_progress_distribution()
                 if distribution_sample is None:
                     free_prob = float(self._scene_obstacle_free_prob())
@@ -203,10 +202,16 @@ class ObstacleRuntimeManager:
                 else:
                     should_spawn, self._episode_fixed_progress_ratio = distribution_sample
                     spawn_decision = "fixed_progress_distribution"
-                if self._fleet is not None and should_spawn:
-                    self._active_this_episode = bool(self._refresh_obstacle_layout(agent_info=info))
+                if should_spawn:
+                    self._ensure_fleet()
+                    if self._fleet is not None:
+                        self._active_this_episode = bool(
+                            self._refresh_obstacle_layout(agent_info=info)
+                        )
+                    else:
+                        self._deactivate_inactive_fleet(reason="no_spawn")
                 else:
-                    self._park_fleet(reason=spawn_decision if not should_spawn else "no_spawn")
+                    self._deactivate_inactive_fleet(reason=spawn_decision)
             except Exception as exc:
                 self._last_runtime_error = f"{type(exc).__name__}: {exc}"
                 print(
@@ -214,9 +219,9 @@ class ObstacleRuntimeManager:
                     f"{self._last_runtime_error}"
                 )
                 self._active_this_episode = False
-                self._park_fleet(reason="reset_exception")
+                self._deactivate_inactive_fleet(reason="reset_exception")
         else:
-            self._park_fleet(reason="unsupported_scene")
+            self._deactivate_inactive_fleet(reason="unsupported_scene")
 
         refreshed = self._observe_info_and_obs()
         if refreshed is not None:
@@ -387,17 +392,22 @@ class ObstacleRuntimeManager:
         self._log_fleet_debug(event="created")
         # 新 client 连入 DonkeySim 时会先在默认起点短暂出现一帧；
         # 这里送去 staging 并等待回读确认，避免 reset 后短暂残留在赛道上。
-        self._park_fleet(reason="fleet_created")
+        if self._scene_key != "waveshare":
+            self._park_fleet(reason="fleet_created")
+        else:
+            self._log_runtime_debug("fleet_created_hidden", reason="fleet_created")
 
     def _park_car(self, car, idx: int, reason: str = "park") -> Optional[PoseState]:
         preset = self._fleet.preset
         staging_x = float(preset.staging_x_start - int(idx) * preset.staging_x_step)
+        world_y = -500.0 if self._scene_key == "waveshare" else car.default_world_y
         request = {
             "idx": int(idx),
             "reason": str(reason),
             "x": _debug_float(staging_x),
             "z": _debug_float(preset.staging_z),
             "yaw": 0.0,
+            "world_y": _debug_float(world_y),
         }
         self._log_runtime_debug(
             "park_car_start",
@@ -409,7 +419,7 @@ class ObstacleRuntimeManager:
             x=staging_x,
             z=float(preset.staging_z),
             yaw_deg=0.0,
-            world_y=car.default_world_y,
+            world_y=world_y,
             hold_brake=True,
             timeout_s=float(max(0.1, self.config.placement_timeout_s)),
         )
@@ -436,6 +446,50 @@ class ObstacleRuntimeManager:
                     error=f"{type(exc).__name__}: {exc}",
                     after=self._car_debug_state(idx),
                 )
+
+    def _shutdown_fleet(self, reason: str = "inactive") -> None:
+        if self._fleet is None:
+            return
+        cars = list(getattr(self._fleet, "cars", []) or [])
+        car_count = len(cars)
+        self._log_runtime_debug(
+            "fleet_shutdown",
+            reason=str(reason),
+            scene_key=str(self._scene_key),
+            car_count=int(car_count),
+        )
+        if self._scene_key == "waveshare":
+            for idx, car in enumerate(cars):
+                try:
+                    self._park_car(car, idx, reason=f"{reason}_hide_before_shutdown")
+                except Exception as exc:
+                    self._log_runtime_debug(
+                        "park_car_error",
+                        idx=int(idx),
+                        reason=f"{reason}_hide_before_shutdown",
+                        error=f"{type(exc).__name__}: {exc}",
+                        after=self._car_debug_state(idx),
+                    )
+        try:
+            self._fleet.shutdown()
+        except Exception as exc:
+            self._log_runtime_debug(
+                "fleet_shutdown_error",
+                reason=str(reason),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            self._fleet = None
+            self._fleet_scene_key = ""
+            self._episode_modes_used = tuple()
+            self._episode_target_plan = tuple()
+
+    def _deactivate_inactive_fleet(self, reason: str = "inactive") -> None:
+        self._active_this_episode = False
+        if self._scene_key == "waveshare":
+            self._shutdown_fleet(reason=reason)
+        else:
+            self._park_fleet(reason=reason)
 
     def _randomize_ego_spawn(self, obs: np.ndarray, info: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
         target = self._sample_ego_spawn_target()
@@ -512,7 +566,7 @@ class ObstacleRuntimeManager:
                 modes=[str(mode) for mode in active_modes],
                 agent=self._agent_debug_payload(agent_info),
             )
-            self._park_fleet(reason="layout_no_targets")
+            self._deactivate_inactive_fleet(reason="layout_no_targets")
             return False
         planned_targets = list(targets[:active_count])
         self._episode_target_plan = tuple(planned_targets)
@@ -553,7 +607,9 @@ class ObstacleRuntimeManager:
                     self._last_runtime_error = "unstable_static_obstacle_placement"
                     self._episode_modes_used = tuple()
                     self._episode_target_plan = tuple()
-                    self._park_fleet(reason="unstable_static_obstacle_placement")
+                    self._deactivate_inactive_fleet(
+                        reason="unstable_static_obstacle_placement"
+                    )
                     return False
                 target = placed_target
                 planned_targets[idx] = placed_target
@@ -580,15 +636,23 @@ class ObstacleRuntimeManager:
                     safety_margin=safety_margin,
                 )
             elif mode == "lane_pid":
-                car.start_lane_pid(
-                    target_speed=self._lane_pid_speed_for_scene(),
-                    progress_ratio=target.progress_ratio,
-                    lateral_ratio=target.lateral_ratio,
-                    lookahead_m=self.config.lane_pid_lookahead_m,
-                    place_on_start=True,
+                placed_target = self._start_lane_pid_with_fallback(
+                    car=car,
+                    idx=idx,
+                    target=target,
                     obstacle_radius=obstacle_radius,
                     safety_margin=safety_margin,
                 )
+                if placed_target is None:
+                    self._last_runtime_error = "unstable_lane_pid_obstacle_placement"
+                    self._episode_modes_used = tuple()
+                    self._episode_target_plan = tuple()
+                    self._deactivate_inactive_fleet(
+                        reason="unstable_lane_pid_obstacle_placement"
+                    )
+                    return False
+                target = placed_target
+                planned_targets[idx] = placed_target
             else:
                 raise ValueError(f"Unsupported obstacle mode: {mode}")
         self._episode_target_plan = tuple(planned_targets)
@@ -666,6 +730,84 @@ class ObstacleRuntimeManager:
                     reason="unstable_static_obstacle_fallback",
                 )
         return None
+
+    def _start_lane_pid_with_fallback(
+        self,
+        car,
+        idx: int,
+        target: TrackTarget,
+        obstacle_radius: float,
+        safety_margin: float,
+    ) -> Optional[TrackTarget]:
+        placed_target, pose = self._start_lane_pid_target(
+            car=car,
+            target=target,
+            obstacle_radius=obstacle_radius,
+            safety_margin=safety_margin,
+        )
+        if self._active_target_pose_is_stable(pose, placed_target):
+            return placed_target
+
+        self._log_runtime_debug(
+            "active_lane_pid_unstable",
+            idx=int(idx),
+            target=self._target_debug_payload(placed_target),
+            observed=self._pose_debug_payload(pose),
+            target_error=self._target_error_debug(pose, placed_target),
+        )
+        if self._scene_key != "waveshare":
+            return placed_target
+
+        self._reset_static_car_for_fallback(
+            car=car,
+            idx=idx,
+            reason="unstable_lane_pid_obstacle_placement",
+        )
+        retry_target, retry_pose = self._start_lane_pid_target(
+            car=car,
+            target=target,
+            obstacle_radius=obstacle_radius,
+            safety_margin=safety_margin,
+        )
+        retry_stable = self._active_target_pose_is_stable(retry_pose, retry_target)
+        self._log_runtime_debug(
+            "active_lane_pid_retry_after_reset",
+            idx=int(idx),
+            stable=bool(retry_stable),
+            target=self._target_debug_payload(retry_target),
+            observed=self._pose_debug_payload(retry_pose),
+            target_error=self._target_error_debug(retry_pose, retry_target),
+        )
+        if retry_stable:
+            return retry_target
+        if self._active_target_pose_is_obviously_unstable(retry_pose):
+            self._reset_static_car_for_fallback(
+                car=car,
+                idx=idx,
+                reason="unstable_lane_pid_obstacle_retry",
+            )
+        return None
+
+    def _start_lane_pid_target(
+        self,
+        car,
+        target: TrackTarget,
+        obstacle_radius: float,
+        safety_margin: float,
+    ) -> Tuple[TrackTarget, Optional[PoseState]]:
+        placed_target = car.start_lane_pid(
+            target_speed=self._lane_pid_speed_for_scene(),
+            progress_ratio=target.progress_ratio,
+            lateral_ratio=target.lateral_ratio,
+            lookahead_m=self.config.lane_pid_lookahead_m,
+            place_on_start=True,
+            obstacle_radius=obstacle_radius,
+            safety_margin=safety_margin,
+        )
+        if not isinstance(placed_target, TrackTarget):
+            placed_target = target
+        pose = self._observe_active_target_pose(car=car, target=placed_target)
+        return placed_target, pose
 
     def _place_static_target(self, car, target: TrackTarget) -> Optional[PoseState]:
         try:
@@ -1123,6 +1265,7 @@ class ObstacleRuntimeManager:
         entries = self._snapshot_debug_entries(snapshots)
         anomaly = False
         for entry in entries:
+            mode = str(entry.get("mode", "")).strip().lower()
             target_error = entry.get("target_error")
             pose = entry.get("pose")
             if pose is None:
@@ -1137,7 +1280,7 @@ class ObstacleRuntimeManager:
                 if speed is not None and float(speed) > 8.0:
                     anomaly = True
                     break
-            if isinstance(target_error, dict):
+            if mode != "lane_pid" and isinstance(target_error, dict):
                 planar = target_error.get("planar")
                 if planar is not None and float(planar) > 0.75:
                     anomaly = True
