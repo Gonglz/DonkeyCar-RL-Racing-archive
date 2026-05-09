@@ -2680,7 +2680,7 @@ def train_v17_auto_curriculum(
     return auto_summary
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="V17: LiDAR-first recurrent PPO",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -2822,7 +2822,7 @@ def main() -> None:
     parser.add_argument("--reward-safe-follow-bonus", type=float, default=0.02)
     parser.add_argument("--reward-prepare-pass-bonus", type=float, default=0.04)
     parser.add_argument("--reward-commit-pass-bonus", type=float, default=0.04)
-    parser.add_argument("--reward-post-pass-bonus", type=float, default=0.5)
+    parser.add_argument("--reward-post-pass-bonus", type=float, default=0.0)
     parser.add_argument("--terminal-offtrack-progress-scale", type=float, default=1.0)
     parser.add_argument("--bad-episode-guard-min-steps", type=int, default=320)
     parser.add_argument("--bad-episode-guard-reward-floor", type=float, default=-160.0)
@@ -2912,6 +2912,11 @@ def main() -> None:
         default=1.0,
         help="Simulator timescale used for dt-aware control/safety/sim2real scaling.",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     manual_curriculum_phase = args.curriculum_phase

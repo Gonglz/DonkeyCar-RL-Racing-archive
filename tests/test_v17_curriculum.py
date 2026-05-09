@@ -258,6 +258,10 @@ class V17CurriculumTests(unittest.TestCase):
             signature.parameters["reward_post_pass_bonus"].default,
             0.0,
         )
+        self.assertEqual(
+            v17.build_arg_parser().parse_args([]).reward_post_pass_bonus,
+            0.0,
+        )
         self.assertEqual(v17.TRAIN_V17_CURRICULUM_DEFAULTS["reward_post_pass_bonus"], 0.0)
 
         for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
