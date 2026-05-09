@@ -193,6 +193,20 @@ class V17CurriculumTests(unittest.TestCase):
                 stage_name,
             )
 
+    def test_lane_pid_stages_place_gt_obstacles_near_start(self):
+        expected_ws_bounds = {
+            "lane_pid_intro": (0.40, 0.60),
+            "lane_pid_mid": (0.35, 0.70),
+            "lane_pid_full": (0.25, 0.85),
+        }
+
+        for stage_name, ws_bounds in expected_ws_bounds.items():
+            phase = v17.CURRICULUM_PHASES[stage_name]
+            self.assertEqual(phase["obstacle_progress_min"], 0.10, stage_name)
+            self.assertEqual(phase["obstacle_progress_max"], 0.20, stage_name)
+            self.assertEqual(phase["ws_obstacle_progress_min"], ws_bounds[0], stage_name)
+            self.assertEqual(phase["ws_obstacle_progress_max"], ws_bounds[1], stage_name)
+
     def test_lane_pid_stages_use_gradual_speed_schedule(self):
         expected = {
             "lane_pid_intro": {
