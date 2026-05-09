@@ -95,6 +95,95 @@ class V17CurriculumTests(unittest.TestCase):
             self.assertEqual(phase["ws_obstacle_free_prob"], 0.05)
             self.assertEqual(phase["obstacle_target_ratios"], {"ws": 0.95, "gt": 0.95})
 
+    def test_avoid_static_uses_stronger_clearance_penalties_and_gate_limits(self):
+        phase = v17.CURRICULUM_PHASES["avoid_static"]
+        reward_overrides = phase["reward_overrides_by_logging_key"]
+
+        self.assertEqual(reward_overrides["ws"]["obstacle_clearance_penalty_scale"], 1.0)
+        self.assertEqual(reward_overrides["gt"]["obstacle_clearance_penalty_scale"], 0.8)
+
+        stage = next(
+            stage for stage in v17.AUTO_CURRICULUM_STAGES
+            if stage["stage_name"] == "avoid_static"
+        )
+        self.assertEqual(
+            stage["max_obstacle_clearance_critical_rate_by_key"],
+            {"ws": 0.0, "gt": 0.0},
+        )
+        self.assertEqual(
+            stage["max_obstacle_clearance_band_rate_by_key"],
+            {"ws": 0.05, "gt": 0.05},
+        )
+
+    def test_clearance_gate_rejects_soft_lap_with_close_obstacle(self):
+        callback = v17.CurriculumWindowAdvanceCallback(
+            stage_name="avoid_static",
+            required_logging_keys=["ws"],
+            min_stage_timesteps=0,
+            recent_episodes=10,
+            min_success_episodes=1,
+            min_soft_laps=2.0,
+            max_obstacle_clearance_critical_rate_by_key={"ws": 0.0},
+            max_obstacle_clearance_band_rate_by_key={"ws": 0.05},
+        )
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                "logging_key": "ws",
+                "episode_reward": 100.0,
+                "episode_len": 500,
+                "ep_obstacle_clearance_critical_rate": 0.01,
+                "ep_obstacle_clearance_band_rate": 0.04,
+            },
+            soft_laps=2.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (0.0, "clearance_critical_above_threshold"))
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                "logging_key": "ws",
+                "episode_reward": 100.0,
+                "episode_len": 500,
+                "ep_obstacle_clearance_critical_rate": 0.0,
+                "ep_obstacle_clearance_band_rate": 0.08,
+            },
+            soft_laps=2.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (0.0, "clearance_band_above_threshold"))
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                "logging_key": "ws",
+                "episode_reward": 100.0,
+                "episode_len": 500,
+                "ep_obstacle_clearance_critical_rate": 0.0,
+                "ep_obstacle_clearance_band_rate": 0.03,
+            },
+            soft_laps=2.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (1.0, "soft_lap"))
+
+    def test_resume_learn_target_adds_stage_budget_to_existing_timesteps(self):
+        self.assertEqual(
+            v17._resolve_learn_total_timesteps(
+                requested_timesteps=800_000,
+                model_start_timesteps=754_661,
+                resume_ckpt_path="/tmp/model.zip",
+            ),
+            1_554_661,
+        )
+        self.assertEqual(
+            v17._resolve_learn_total_timesteps(
+                requested_timesteps=800_000,
+                model_start_timesteps=754_661,
+                resume_ckpt_path=None,
+            ),
+            800_000,
+        )
+
     def test_ws_obstacle_laterals_use_edge_targets(self):
         checked_phases = (
             "warmup",

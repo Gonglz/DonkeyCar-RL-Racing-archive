@@ -516,12 +516,12 @@ CURRICULUM_PHASES["avoid_static"].update(
         "obstacle_target_ratios": {"ws": 0.90, "gt": 0.90},
         "reward_overrides_by_logging_key": {
             "ws": {
-                "obstacle_clearance_penalty_scale": 0.45,
+                "obstacle_clearance_penalty_scale": 1.00,
                 "obstacle_clearance_inner_m": _V17_OBSTACLE_CLEARANCE_INNER_M,
                 "obstacle_clearance_outer_m": _V17_OBSTACLE_CLEARANCE_OUTER_M,
             },
             "gt": {
-                "obstacle_clearance_penalty_scale": 0.40,
+                "obstacle_clearance_penalty_scale": 0.80,
                 "obstacle_clearance_inner_m": _V17_OBSTACLE_CLEARANCE_INNER_M,
                 "obstacle_clearance_outer_m": _V17_OBSTACLE_CLEARANCE_OUTER_M,
             },
@@ -539,12 +539,12 @@ CURRICULUM_PHASES["avoid_mixed"].update(
         "obstacle_target_ratios": {"ws": 0.90, "gt": 0.90},
         "reward_overrides_by_logging_key": {
             "ws": {
-                "obstacle_clearance_penalty_scale": 0.55,
+                "obstacle_clearance_penalty_scale": 1.10,
                 "obstacle_clearance_inner_m": _V17_OBSTACLE_CLEARANCE_INNER_M,
                 "obstacle_clearance_outer_m": _V17_OBSTACLE_CLEARANCE_OUTER_M,
             },
             "gt": {
-                "obstacle_clearance_penalty_scale": 0.45,
+                "obstacle_clearance_penalty_scale": 0.90,
                 "obstacle_clearance_inner_m": _V17_OBSTACLE_CLEARANCE_INNER_M,
                 "obstacle_clearance_outer_m": _V17_OBSTACLE_CLEARANCE_OUTER_M,
             },
@@ -659,11 +659,15 @@ _V17_STAGE_GATE_OVERRIDES = {
         "min_stage_timesteps": 150_000,
         "max_stage_timesteps": 800_000,
         "max_collision_rate_by_key": {"ws": 0.55, "gt": 0.60},
+        "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
+        "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
     },
     "avoid_mixed": {
         "min_stage_timesteps": 180_000,
         "max_stage_timesteps": 800_000,
         "max_collision_rate_by_key": {"ws": 0.55, "gt": 0.60},
+        "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
+        "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
     },
     "lane_pid_intro": {
         "min_stage_timesteps": 180_000,
@@ -758,6 +762,17 @@ def _clone_curriculum_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _clone_curriculum_value(v) for k, v in value.items()}
     return value
+
+
+def _resolve_learn_total_timesteps(
+    requested_timesteps: int,
+    model_start_timesteps: int,
+    resume_ckpt_path: Optional[str],
+) -> int:
+    requested = max(0, int(requested_timesteps))
+    if resume_ckpt_path is None:
+        return requested
+    return max(0, int(model_start_timesteps)) + requested
 
 
 def _resolve_curriculum_phase(curriculum_phase: Optional[str]) -> Optional[str]:
@@ -2118,9 +2133,14 @@ def train_v17(
     print("=" * 76)
     start_time = time.time()
     interrupted = False
+    learn_total_timesteps = _resolve_learn_total_timesteps(
+        requested_timesteps=total_timesteps,
+        model_start_timesteps=model_start_timesteps,
+        resume_ckpt_path=resume_ckpt_path,
+    )
     try:
         model.learn(
-            total_timesteps=total_timesteps,
+            total_timesteps=learn_total_timesteps,
             callback=callbacks,
             progress_bar=False,
             reset_num_timesteps=(resume_ckpt_path is None),
@@ -2491,6 +2511,12 @@ def train_v17_auto_curriculum(
                 max_episode_speed_mean=stage_def.get("max_episode_speed_mean"),
                 max_episode_speed_max=stage_def.get("max_episode_speed_max"),
                 max_collision_rate_by_key=stage_def.get("max_collision_rate_by_key"),
+                max_obstacle_clearance_critical_rate_by_key=stage_def.get(
+                    "max_obstacle_clearance_critical_rate_by_key"
+                ),
+                max_obstacle_clearance_band_rate_by_key=stage_def.get(
+                    "max_obstacle_clearance_band_rate_by_key"
+                ),
                 max_stage_timesteps=int(stage_def["max_stage_timesteps"]),
                 save_dir=save_dir,
                 exp_tag=stage_exp_tag,

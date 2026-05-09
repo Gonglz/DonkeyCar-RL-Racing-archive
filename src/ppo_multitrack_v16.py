@@ -489,6 +489,8 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         max_episode_speed_max: Optional[float] = None,
         require_no_stuck_for_success: bool = True,
         max_collision_rate_by_key: Optional[Dict[str, float]] = None,
+        max_obstacle_clearance_critical_rate_by_key: Optional[Dict[str, float]] = None,
+        max_obstacle_clearance_band_rate_by_key: Optional[Dict[str, float]] = None,
         max_stage_timesteps: Optional[int] = None,
         save_dir: Optional[str] = None,
         exp_tag: Optional[str] = None,
@@ -518,17 +520,15 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             None if max_episode_speed_max is None else max(0.0, float(max_episode_speed_max))
         )
         self.require_no_stuck_for_success = bool(require_no_stuck_for_success)
-        self.max_collision_rate_by_key: Dict[str, float] = {}
-        for key, limit in dict(max_collision_rate_by_key or {}).items():
-            key_s = str(key)
-            if key_s not in self.required_logging_keys:
-                continue
-            try:
-                limit_f = float(limit)
-            except Exception:
-                continue
-            if np.isfinite(limit_f):
-                self.max_collision_rate_by_key[key_s] = float(np.clip(limit_f, 0.0, 1.0))
+        self.max_collision_rate_by_key = self._normalize_keyed_rate_limits(
+            max_collision_rate_by_key
+        )
+        self.max_obstacle_clearance_critical_rate_by_key = self._normalize_keyed_rate_limits(
+            max_obstacle_clearance_critical_rate_by_key
+        )
+        self.max_obstacle_clearance_band_rate_by_key = self._normalize_keyed_rate_limits(
+            max_obstacle_clearance_band_rate_by_key
+        )
         self.max_stage_timesteps = (
             None if max_stage_timesteps is None else max(1, int(max_stage_timesteps))
         )
@@ -550,6 +550,23 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         self.stop_stage_timesteps = 0
         self._start_num_timesteps = 0
         self._fh = None
+
+    def _normalize_keyed_rate_limits(
+        self,
+        raw_limits: Optional[Dict[str, float]],
+    ) -> Dict[str, float]:
+        limits: Dict[str, float] = {}
+        for key, limit in dict(raw_limits or {}).items():
+            key_s = str(key)
+            if key_s not in self.required_logging_keys:
+                continue
+            try:
+                limit_f = float(limit)
+            except Exception:
+                continue
+            if np.isfinite(limit_f):
+                limits[key_s] = float(np.clip(limit_f, 0.0, 1.0))
+        return limits
 
     def _recover_resume_state(
         self,
@@ -646,7 +663,11 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                         gate_success = float(rec.get("gate_success", np.nan))
                     except Exception:
                         gate_success = np.nan
-                    if not np.isfinite(gate_success):
+                    if (
+                        not np.isfinite(gate_success)
+                        or self.max_obstacle_clearance_critical_rate_by_key
+                        or self.max_obstacle_clearance_band_rate_by_key
+                    ):
                         gate_success, _ = self._record_gate_success(
                             rec,
                             soft_laps=soft_laps,
@@ -744,6 +765,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     "max_episode_speed_max": self.max_episode_speed_max,
                     "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
                     "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
+                    "max_obstacle_clearance_critical_rate_by_key": dict(
+                        self.max_obstacle_clearance_critical_rate_by_key
+                    ),
+                    "max_obstacle_clearance_band_rate_by_key": dict(
+                        self.max_obstacle_clearance_band_rate_by_key
+                    ),
                     "recovered_stage_start_num_timesteps": int(self._start_num_timesteps),
                     "recovered_stage_timesteps": int(self._stage_timesteps()),
                     "recovered_window_sizes": {
@@ -765,6 +792,14 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                     for key, limit in self.max_collision_rate_by_key.items()
                 ]
                 collision_txt = ", " + ", ".join(collision_parts)
+            clearance_parts = []
+            for key, limit in self.max_obstacle_clearance_critical_rate_by_key.items():
+                clearance_parts.append(f"{key} clearance_critical <= {limit:.3f}")
+            for key, limit in self.max_obstacle_clearance_band_rate_by_key.items():
+                clearance_parts.append(f"{key} clearance_band <= {limit:.3f}")
+            clearance_txt = ""
+            if clearance_parts:
+                clearance_txt = ", " + ", ".join(clearance_parts)
             perf_parts = []
             if self.min_episode_len is not None:
                 perf_parts.append(f"len>={self.min_episode_len}")
@@ -790,7 +825,7 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
                 f"after {self.min_stage_timesteps} stage steps, "
                 f"{joined} recent {self.recent_episodes} eps need "
                 f">= {self.min_success_episodes} eps with soft_lap >= {self.min_soft_laps:.1f}"
-                f"{performance_txt}{collision_txt}{max_txt}{inherit_txt}"
+                f"{performance_txt}{collision_txt}{clearance_txt}{max_txt}{inherit_txt}"
             )
 
     def _stage_timesteps(self) -> int:
@@ -850,6 +885,30 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
         term_stuck = self._finite_float(record.get("ep_term_stuck", 0.0), 0.0)
         if self.require_no_stuck_for_success and term_stuck >= 0.5:
             return 0.0, "stuck"
+
+        logging_key = str(
+            record.get("logging_key")
+            or record.get("scene_key")
+            or record.get("domain")
+            or ""
+        )
+        critical_limit = self.max_obstacle_clearance_critical_rate_by_key.get(logging_key)
+        if critical_limit is not None:
+            critical_rate = self._finite_float(
+                record.get("ep_obstacle_clearance_critical_rate", 0.0),
+                0.0,
+            )
+            if critical_rate > float(critical_limit) + 1e-9:
+                return 0.0, "clearance_critical_above_threshold"
+
+        band_limit = self.max_obstacle_clearance_band_rate_by_key.get(logging_key)
+        if band_limit is not None:
+            band_rate = self._finite_float(
+                record.get("ep_obstacle_clearance_band_rate", 0.0),
+                0.0,
+            )
+            if band_rate > float(band_limit) + 1e-9:
+                return 0.0, "clearance_band_above_threshold"
 
         if float(soft_laps) + 1e-9 >= self.min_soft_laps:
             return 1.0, "soft_lap"
@@ -959,6 +1018,12 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             "max_episode_speed_max": self.max_episode_speed_max,
             "require_no_stuck_for_success": bool(self.require_no_stuck_for_success),
             "max_collision_rate_by_key": dict(self.max_collision_rate_by_key),
+            "max_obstacle_clearance_critical_rate_by_key": dict(
+                self.max_obstacle_clearance_critical_rate_by_key
+            ),
+            "max_obstacle_clearance_band_rate_by_key": dict(
+                self.max_obstacle_clearance_band_rate_by_key
+            ),
             "stop_num_timesteps": int(self.stop_num_timesteps),
             "stop_stage_timesteps": int(self.stop_stage_timesteps),
             "window_success_counts": {
@@ -1002,12 +1067,21 @@ class CurriculumWindowAdvanceCallback(BaseCallback):
             term_collision = self._extract_term_collision(info)
             ep = info.get("episode", {})
             gate_record = {
+                "logging_key": logging_key,
                 "episode_reward": ep.get("r", 0.0),
                 "episode_len": ep.get("l", 0),
                 "ep_progress_ratio_forward_sum": info.get("ep_progress_ratio_forward_sum", 0.0),
                 "ep_term_stuck": info.get("ep_term_stuck", 0.0),
                 "ep_speed_mean": info.get("ep_speed_mean", 0.0),
                 "ep_speed_max": info.get("ep_speed_max", 0.0),
+                "ep_obstacle_clearance_critical_rate": info.get(
+                    "ep_obstacle_clearance_critical_rate",
+                    0.0,
+                ),
+                "ep_obstacle_clearance_band_rate": info.get(
+                    "ep_obstacle_clearance_band_rate",
+                    0.0,
+                ),
             }
             gate_success, gate_success_reason = self._record_gate_success(
                 gate_record,
