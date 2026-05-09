@@ -193,6 +193,41 @@ class V17CurriculumTests(unittest.TestCase):
                 stage_name,
             )
 
+    def test_lane_pid_stages_use_gradual_speed_schedule(self):
+        expected = {
+            "lane_pid_intro": {
+                "obstacle_speed": 0.45,
+                "ws_speed_ref_vmax": 0.62,
+                "ws_w_speed_ref": 0.14,
+                "gt_speed_ref_vmax": 0.72,
+                "gt_w_speed_ref": 0.07,
+            },
+            "lane_pid_mid": {
+                "obstacle_speed": 0.50,
+                "ws_speed_ref_vmax": 0.85,
+                "ws_w_speed_ref": 0.09,
+                "gt_speed_ref_vmax": 0.95,
+                "gt_w_speed_ref": 0.05,
+            },
+            "lane_pid_full": {
+                "obstacle_speed": 0.55,
+                "ws_speed_ref_vmax": 1.00,
+                "ws_w_speed_ref": 0.08,
+                "gt_speed_ref_vmax": 1.10,
+                "gt_w_speed_ref": 0.03,
+            },
+        }
+
+        for stage_name, values in expected.items():
+            phase = v17.CURRICULUM_PHASES[stage_name]
+            reward_overrides = phase["reward_overrides_by_logging_key"]
+            self.assertEqual(phase["obstacle_lane_pid_speed_ws"], values["obstacle_speed"], stage_name)
+            self.assertEqual(phase["obstacle_lane_pid_speed_gt"], values["obstacle_speed"], stage_name)
+            self.assertEqual(reward_overrides["ws"]["speed_ref_vmax"], values["ws_speed_ref_vmax"], stage_name)
+            self.assertEqual(reward_overrides["ws"]["w_speed_ref"], values["ws_w_speed_ref"], stage_name)
+            self.assertEqual(reward_overrides["gt"]["speed_ref_vmax"], values["gt_speed_ref_vmax"], stage_name)
+            self.assertEqual(reward_overrides["gt"]["w_speed_ref"], values["gt_w_speed_ref"], stage_name)
+
     def test_lane_pid_stages_require_lane_pid_obstacle_for_gate(self):
         for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
             stage = next(
