@@ -1,3 +1,4 @@
+import inspect
 import math
 import unittest
 from pathlib import Path
@@ -251,6 +252,47 @@ class V17CurriculumTests(unittest.TestCase):
             self.assertEqual(reward_overrides["gt"]["speed_ref_vmax"], values["gt_speed_ref_vmax"], stage_name)
             self.assertEqual(reward_overrides["gt"]["w_speed_ref"], values["gt_w_speed_ref"], stage_name)
 
+    def test_lane_pid_stages_disable_post_pass_bonus_and_extend_cut_in_watch(self):
+        signature = inspect.signature(v17.train_v17)
+        self.assertEqual(
+            signature.parameters["reward_post_pass_bonus"].default,
+            0.0,
+        )
+        self.assertEqual(v17.TRAIN_V17_CURRICULUM_DEFAULTS["reward_post_pass_bonus"], 0.0)
+
+        for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
+            phase = v17.CURRICULUM_PHASES[stage_name]
+            reward_overrides = phase["reward_overrides_by_logging_key"]
+            self.assertEqual(phase["reward_post_pass_bonus"], 0.0, stage_name)
+            for logging_key in ("ws", "gt"):
+                self.assertEqual(
+                    reward_overrides[logging_key]["post_pass_watch_steps"],
+                    42,
+                    (stage_name, logging_key),
+                )
+                self.assertEqual(
+                    reward_overrides[logging_key]["post_pass_watch_longitudinal_m"],
+                    1.8,
+                    (stage_name, logging_key),
+                )
+
+    def test_lane_pid_stages_gate_post_pass_cut_in_and_terminal_collision(self):
+        for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
+            stage = next(
+                stage for stage in v17.AUTO_CURRICULUM_STAGES
+                if stage["stage_name"] == stage_name
+            )
+            self.assertEqual(
+                stage["max_post_pass_cut_in_rate_by_key"],
+                {"ws": 0.02, "gt": 0.02},
+                stage_name,
+            )
+            self.assertEqual(
+                stage["max_post_pass_terminal_collision_rate_by_key"],
+                {"ws": 0.0, "gt": 0.0},
+                stage_name,
+            )
+
     def test_lane_pid_stages_require_lane_pid_obstacle_for_gate(self):
         for stage_name in ("lane_pid_intro", "lane_pid_mid", "lane_pid_full"):
             stage = next(
@@ -290,6 +332,59 @@ class V17CurriculumTests(unittest.TestCase):
                 "ep_obstacle_has_lane_pid": 1.0,
             },
             soft_laps=3.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (1.0, "soft_lap"))
+
+    def test_post_pass_gate_rejects_cut_in_and_terminal_collision(self):
+        callback = v17.CurriculumWindowAdvanceCallback(
+            stage_name="lane_pid_intro",
+            required_logging_keys=["ws"],
+            min_stage_timesteps=0,
+            recent_episodes=10,
+            min_success_episodes=1,
+            min_soft_laps=2.0,
+            max_post_pass_cut_in_rate_by_key={"ws": 0.02},
+            max_post_pass_terminal_collision_rate_by_key={"ws": 0.0},
+        )
+
+        base_record = {
+            "logging_key": "ws",
+            "episode_reward": 100.0,
+            "episode_len": 500,
+        }
+        gate_success, reason = callback._record_gate_success(
+            {
+                **base_record,
+                "ep_post_pass_cut_in_rate": 0.03,
+                "ep_post_pass_terminal_collision": 0.0,
+            },
+            soft_laps=2.0,
+            term_collision=0.0,
+        )
+        self.assertEqual((gate_success, reason), (0.0, "post_pass_cut_in_above_threshold"))
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                **base_record,
+                "ep_post_pass_cut_in_rate": 0.0,
+                "ep_post_pass_terminal_collision": 1.0,
+            },
+            soft_laps=2.0,
+            term_collision=0.0,
+        )
+        self.assertEqual(
+            (gate_success, reason),
+            (0.0, "post_pass_terminal_collision_above_threshold"),
+        )
+
+        gate_success, reason = callback._record_gate_success(
+            {
+                **base_record,
+                "ep_post_pass_cut_in_rate": 0.02,
+                "ep_post_pass_terminal_collision": 0.0,
+            },
+            soft_laps=2.0,
             term_collision=0.0,
         )
         self.assertEqual((gate_success, reason), (1.0, "soft_lap"))

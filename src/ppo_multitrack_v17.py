@@ -184,8 +184,8 @@ _V17_OVERTAKE_LATERAL_CLEARANCE_M = 0.30
 _V17_OVERTAKE_CAPSULE_LONGITUDINAL_M = 0.50
 _V17_OBSTACLE_CLEARANCE_INNER_M = 0.30
 _V17_OBSTACLE_CLEARANCE_OUTER_M = 0.60
-_V17_POST_PASS_WATCH_LONGITUDINAL_M = 1.20
-_V17_POST_PASS_WATCH_STEPS = 18
+_V17_POST_PASS_WATCH_LONGITUDINAL_M = 1.80
+_V17_POST_PASS_WATCH_STEPS = 42
 _V17_OVERTAKE_SUCCESS_MIN_PROGRESS_RATIO = 1e-6
 _V17_WS_FOLLOW_MIN_M = 0.80
 _V17_WS_FOLLOW_MAX_M = 1.80
@@ -686,6 +686,8 @@ _V17_STAGE_GATE_OVERRIDES = {
         "max_collision_rate_by_key": {"ws": 0.25, "gt": 0.35},
         "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
         "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
+        "max_post_pass_cut_in_rate_by_key": {"ws": 0.02, "gt": 0.02},
+        "max_post_pass_terminal_collision_rate_by_key": {"ws": 0.0, "gt": 0.0},
     },
     "lane_pid_mid": {
         "min_stage_timesteps": 220_000,
@@ -695,6 +697,8 @@ _V17_STAGE_GATE_OVERRIDES = {
         "max_collision_rate_by_key": {"ws": 0.18, "gt": 0.25},
         "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
         "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
+        "max_post_pass_cut_in_rate_by_key": {"ws": 0.02, "gt": 0.02},
+        "max_post_pass_terminal_collision_rate_by_key": {"ws": 0.0, "gt": 0.0},
     },
     "lane_pid_full": {
         "min_stage_timesteps": 240_000,
@@ -704,6 +708,8 @@ _V17_STAGE_GATE_OVERRIDES = {
         "max_collision_rate_by_key": {"ws": 0.20, "gt": 0.30},
         "max_obstacle_clearance_critical_rate_by_key": {"ws": 0.0, "gt": 0.0},
         "max_obstacle_clearance_band_rate_by_key": {"ws": 0.05, "gt": 0.05},
+        "max_post_pass_cut_in_rate_by_key": {"ws": 0.02, "gt": 0.02},
+        "max_post_pass_terminal_collision_rate_by_key": {"ws": 0.0, "gt": 0.0},
     },
 }
 AUTO_CURRICULUM_STAGES = tuple(
@@ -1265,7 +1271,7 @@ def train_v17(
     reward_safe_follow_bonus: float = 0.02,
     reward_prepare_pass_bonus: float = 0.04,
     reward_commit_pass_bonus: float = 0.04,
-    reward_post_pass_bonus: float = 0.5,
+    reward_post_pass_bonus: float = 0.0,
     reward_post_pass_steps: int = 10,
     reward_overrides_by_logging_key: Optional[Dict[str, Dict[str, Any]]] = None,
     terminal_offtrack_progress_scale: float = 1.0,
@@ -2535,6 +2541,12 @@ def train_v17_auto_curriculum(
                 ),
                 max_obstacle_clearance_band_rate_by_key=stage_def.get(
                     "max_obstacle_clearance_band_rate_by_key"
+                ),
+                max_post_pass_cut_in_rate_by_key=stage_def.get(
+                    "max_post_pass_cut_in_rate_by_key"
+                ),
+                max_post_pass_terminal_collision_rate_by_key=stage_def.get(
+                    "max_post_pass_terminal_collision_rate_by_key"
                 ),
                 max_stage_timesteps=int(stage_def["max_stage_timesteps"]),
                 save_dir=save_dir,
