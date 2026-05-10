@@ -1,0 +1,5 @@
+models/v17_postpass_hard_gate_resume_20260509_190133/v17_1981788_steps.zip filter=lfs diff=lfs merge=lfs -text
+models/v17_postpass_hard_gate_resume_20260509_190133/train_stdout.log filter=lfs diff=lfs merge=lfs -text
+models/v17_postpass_hard_gate_resume_20260509_190133/train_metrics.jsonl filter=lfs diff=lfs merge=lfs -text
+models/v17_postpass_hard_gate_resume_20260509_190133/curriculum_window.jsonl filter=lfs diff=lfs merge=lfs -text
+models/v17_postpass_hard_gate_resume_20260509_190133/final_model.zip filter=lfs diff=lfs merge=lfs -text

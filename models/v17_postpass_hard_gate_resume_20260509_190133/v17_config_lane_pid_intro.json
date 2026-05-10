@@ -1,0 +1,658 @@
+{
+  "version": "V17",
+  "timestamp": "2026-05-10T04:15:09.673867",
+  "curriculum": {
+    "phase": "lane_pid_intro",
+    "applied_overrides": {
+      "scene_weights": [
+        0.5,
+        0.5
+      ],
+      "enable_dynamic_scene_weights": true,
+      "enable_step_balance_sampling": true,
+      "obstacle_enabled": true,
+      "obstacle_count": 1,
+      "obstacle_free_prob": 0.05,
+      "obstacle_modes": [
+        "lane_pid"
+      ],
+      "obstacle_progress_min": 0.1,
+      "obstacle_progress_max": 0.2,
+      "ws_obstacle_free_prob": 0.05,
+      "ws_obstacle_modes": [
+        "lane_pid"
+      ],
+      "ws_obstacle_progress_min": 0.4,
+      "ws_obstacle_progress_max": 0.6,
+      "ws_obstacle_fixed_lateral_ratio": null,
+      "obstacle_randomize_non_lane_pid_yaw": false,
+      "obstacle_spawn_ahead_min_m": 3.5,
+      "obstacle_spawn_ahead_max_m": 9.0,
+      "obstacle_min_agent_planar_dist_m": 1.5,
+      "obstacle_min_agent_arc_dist_m": 3.8,
+      "obstacle_lane_pid_speed_gt": 0.45,
+      "obstacle_lane_pid_speed_ws": 0.45,
+      "collision_penalty_base": 58.0,
+      "offtrack_penalty_base": 12.0,
+      "w_near_collision": 1.28,
+      "near_collision_start_ratio": 0.62,
+      "obstacle_target_ratios": {
+        "ws": 0.95,
+        "gt": 0.95
+      },
+      "window_episode_count": 50,
+      "max_compensation_ratio": 0.1,
+      "w_d": 0.06,
+      "w_dd": 0.02,
+      "w_m": 0.03,
+      "w_sat": 0.1,
+      "w_steer_budget": 0.0,
+      "w_sign_flip": 0.0,
+      "w_micro_wiggle": 0.0,
+      "micro_wiggle_min_abs_steer": 0.035,
+      "micro_wiggle_max_abs_steer": 0.22,
+      "terminal_offtrack_progress_scale": 0.0,
+      "overtake_success_bonus": 0.5,
+      "reward_post_pass_bonus": 0.0,
+      "reward_overrides_by_logging_key": {
+        "ws": {
+          "progress_reward_scale": 38.0,
+          "survival_reward_scale": 0.2,
+          "w_speed_ref": 0.14,
+          "speed_ref_vmin": 0.24,
+          "speed_ref_vmax": 0.62,
+          "collision_episode_reward_cap": 56.0,
+          "offtrack_episode_reward_cap": 70.0,
+          "offtrack_leniency_ratio": 0.14,
+          "offtrack_leniency_mult": 1.8,
+          "safe_follow_bonus_scale": 0.3,
+          "safe_follow_min_m": 0.8,
+          "safe_follow_max_m": 1.8,
+          "safe_follow_risk_max": 0.36,
+          "safe_follow_ttc_min_s": 1.8,
+          "safe_follow_ttc_max_s": 5.2,
+          "wait_window_bonus_scale": 0.35,
+          "wait_window_min_gap_m": 0.8,
+          "wait_window_max_gap_m": 2.2,
+          "wait_window_max_closing_rate": 0.12,
+          "force_pass_penalty_scale": 1.18,
+          "unsafe_close_penalty_scale": 0.95,
+          "obstacle_clearance_penalty_scale": 0.9,
+          "obstacle_clearance_inner_m": 0.3,
+          "obstacle_clearance_outer_m": 0.6,
+          "post_pass_cut_in_penalty_scale": 1.1,
+          "post_pass_watch_longitudinal_m": 1.8,
+          "post_pass_watch_steps": 42,
+          "overtake_success_min_progress_ratio": 1e-06,
+          "unsafe_close_gap_m": 0.55,
+          "unsafe_close_clearance_m": 0.3,
+          "unsafe_close_longitudinal_m": 0.5,
+          "lateral_overlap_ref_m": 0.3,
+          "unsafe_close_ttc_s": 2.2,
+          "overtake_arm_longitudinal_min_m": 0.45,
+          "overtake_arm_planar_max_m": 2.6,
+          "overtake_pass_longitudinal_threshold_m": -0.45,
+          "overtake_pass_planar_min_m": 0.6,
+          "close_front_planar_max_m": 2.6,
+          "force_pass_planar_max_m": 2.6
+        },
+        "gt": {
+          "progress_reward_scale": 44.0,
+          "survival_reward_scale": 0.2,
+          "w_speed_ref": 0.07,
+          "speed_ref_vmin": 0.28,
+          "speed_ref_vmax": 0.72,
+          "collision_episode_reward_cap": 82.0,
+          "offtrack_episode_reward_cap": 75.0,
+          "offtrack_leniency_ratio": 0.14,
+          "offtrack_leniency_mult": 1.8,
+          "safe_follow_bonus_scale": 0.25,
+          "safe_follow_min_m": 1.0,
+          "safe_follow_max_m": 1.4,
+          "safe_follow_risk_max": 0.38,
+          "safe_follow_ttc_min_s": 1.6,
+          "safe_follow_ttc_max_s": 5.0,
+          "wait_window_bonus_scale": 0.3,
+          "wait_window_min_gap_m": 1.0,
+          "wait_window_max_gap_m": 3.0,
+          "wait_window_max_closing_rate": 0.14,
+          "force_pass_penalty_scale": 0.86,
+          "unsafe_close_penalty_scale": 0.75,
+          "obstacle_clearance_penalty_scale": 0.7,
+          "obstacle_clearance_inner_m": 0.3,
+          "obstacle_clearance_outer_m": 0.6,
+          "post_pass_cut_in_penalty_scale": 0.85,
+          "post_pass_watch_longitudinal_m": 1.8,
+          "post_pass_watch_steps": 42,
+          "overtake_success_min_progress_ratio": 1e-06,
+          "unsafe_close_gap_m": 0.9,
+          "unsafe_close_clearance_m": 0.3,
+          "unsafe_close_longitudinal_m": 0.5,
+          "lateral_overlap_ref_m": 0.3,
+          "unsafe_close_ttc_s": 2.2,
+          "overtake_arm_longitudinal_min_m": 0.7,
+          "overtake_arm_planar_max_m": 5.0,
+          "overtake_pass_longitudinal_threshold_m": -0.7,
+          "overtake_pass_planar_min_m": 0.7,
+          "close_front_planar_max_m": 5.0,
+          "force_pass_planar_max_m": 5.0
+        }
+      },
+      "ws_obstacle_lateral_choices": [
+        0.0,
+        1.0
+      ]
+    },
+    "explicit_cli_keys": []
+  },
+  "env_ids": [
+    "donkey-waveshare-v0",
+    "donkey-generated-track-v0"
+  ],
+  "scene_weights": [
+    0.5,
+    0.5
+  ],
+  "track_dir": "/home/longzhao/track",
+  "sim": {
+    "path": "remote",
+    "launch_sim": false,
+    "host": "127.0.0.1",
+    "port": 9091,
+    "ports": [
+      9091,
+      9093
+    ],
+    "port_per_scene": [
+      {
+        "scene_idx": 0,
+        "env_id": "donkey-waveshare-v0",
+        "scene_key": "waveshare",
+        "logging_key": "ws",
+        "port": 9091
+      },
+      {
+        "scene_idx": 1,
+        "env_id": "donkey-generated-track-v0",
+        "scene_key": "generated_track",
+        "logging_key": "gt",
+        "port": 9093
+      }
+    ]
+  },
+  "track_geometry_summary": {
+    "waveshare": {
+      "points": 240,
+      "loop_len": 8.299922181545416,
+      "width_mean": 0.55,
+      "width_min": 0.5499999999999998,
+      "width_max": 0.5500000000000002,
+      "cte_left": 2.4,
+      "cte_right": -2.0,
+      "cte_left_out": 2.6,
+      "cte_right_out": -2.2,
+      "cte_half_width": 2.2,
+      "n_corners": 48
+    },
+    "generated_track": {
+      "points": 1080,
+      "loop_len": 26.862153213176136,
+      "width_mean": 1.15,
+      "width_min": 1.1499999999999981,
+      "width_max": 1.1500000000000017,
+      "cte_left": 6.6,
+      "cte_right": -2.6,
+      "cte_left_out": 6.8,
+      "cte_right_out": -2.8,
+      "cte_half_width": 4.6,
+      "n_corners": 216
+    }
+  },
+  "observation": {
+    "image_shape": [
+      6,
+      128,
+      128
+    ],
+    "image_channels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "state_dim": 7,
+    "lidar_dim": 144,
+    "lidar_meta_dim": 2,
+    "disable_lidar_meta": false,
+    "lidar_encoder_mode": "side_separated",
+    "lidar_obs_mode": "full"
+  },
+  "lidar": {
+    "num_sectors": 72,
+    "fov_deg": 360.0,
+    "max_range_m": 20.0,
+    "near_clip_m": 0.18,
+    "repeat_min_steps": 2,
+    "repeat_max_steps": 4
+  },
+  "sim2real": {
+    "json": null,
+    "throttle_gain_floor": 0.25,
+    "throttle_gain_override": null,
+    "steer_gain_floor": null,
+    "steer_gain_override": null,
+    "filter_dt_s": 0.05
+  },
+  "timescale": {
+    "sim_timescale": 1.0,
+    "base": {
+      "control_dt": 0.05,
+      "adapter_k_delta": 0.15,
+      "adapter_lambda_bias": 0.2,
+      "delta_max": 0.35,
+      "beta": 0.6,
+      "steer_delta_delta_max": null,
+      "lidar_repeat_min_steps": 2,
+      "lidar_repeat_max_steps": 4
+    },
+    "scaled": {
+      "control_dt": 0.05,
+      "adapter_k_delta": 0.15,
+      "adapter_lambda_bias": 0.2,
+      "delta_max": 0.35,
+      "beta": 0.6,
+      "steer_delta_delta_max": null,
+      "lidar_repeat_min_steps": 2,
+      "lidar_repeat_max_steps": 4
+    }
+  },
+  "action_adapter": {
+    "k_delta": 0.15,
+    "lambda_bias": 0.2,
+    "k_bias": 0.15,
+    "steer_core_decay": 0.0,
+    "v_nominal": 1.15,
+    "k_turn": 0.55,
+    "k_bias_speed": 0.0,
+    "alpha_speed": 0.55,
+    "v_min": 0.35,
+    "v_max": 2.0,
+    "max_throttle": 0.8,
+    "speed_kp": 0.35,
+    "speed_ki": 0.08,
+    "speed_kff": 0.1,
+    "control_dt": 0.05,
+    "allow_reverse": false
+  },
+  "steering_safety": {
+    "delta_max": 0.35,
+    "enable_lpf": true,
+    "beta": 0.6,
+    "delta_delta_max": null,
+    "servo_deadband": 0.0
+  },
+  "ppo": {
+    "learning_rate": 8e-05,
+    "ent_coef": 0.01,
+    "n_steps": 4096,
+    "batch_size": 256,
+    "n_epochs": 4,
+    "clip_range": 0.2,
+    "target_kl": 0.02,
+    "final_learning_rate": 2e-05,
+    "lstm_hidden_size": 256,
+    "lstm_layers": 2,
+    "checkpoint_keep_last": 5,
+    "best_model_name_prefix": "best_model_lane_pid_intro"
+  },
+  "reward": {
+    "progress_reward_scale": 48.0,
+    "survival_reward_scale": 0.3,
+    "collision_penalty_base": 58.0,
+    "offtrack_penalty_base": 12.0,
+    "w_d": 0.06,
+    "w_dd": 0.02,
+    "w_m": 0.03,
+    "w_sat": 0.1,
+    "w_steer_budget": 0.0,
+    "steer_budget_straight": 0.58,
+    "steer_budget_curve": 0.88,
+    "steer_budget_obstacle_relief": 0.16,
+    "w_sign_flip": 0.0,
+    "sign_flip_min_abs_steer": 0.2,
+    "w_micro_wiggle": 0.0,
+    "micro_wiggle_min_abs_steer": 0.035,
+    "micro_wiggle_max_abs_steer": 0.22,
+    "w_speed_ref": 0.0,
+    "speed_ref_vmin": 0.35,
+    "speed_ref_vmax": 2.2,
+    "speed_ref_kappa_ref": 0.15,
+    "w_near_collision": 1.28,
+    "near_collision_start_ratio": 0.62,
+    "overtake_success_bonus": 0.5,
+    "reward_safe_follow_bonus": 0.02,
+    "reward_prepare_pass_bonus": 0.04,
+    "reward_commit_pass_bonus": 0.04,
+    "reward_post_pass_bonus": 0.0,
+    "reward_overrides_by_logging_key": {
+      "ws": {
+        "progress_reward_scale": 38.0,
+        "survival_reward_scale": 0.2,
+        "w_speed_ref": 0.14,
+        "speed_ref_vmin": 0.24,
+        "speed_ref_vmax": 0.62,
+        "collision_episode_reward_cap": 56.0,
+        "offtrack_episode_reward_cap": 70.0,
+        "offtrack_leniency_ratio": 0.14,
+        "offtrack_leniency_mult": 1.8,
+        "safe_follow_bonus_scale": 0.3,
+        "safe_follow_min_m": 0.8,
+        "safe_follow_max_m": 1.8,
+        "safe_follow_risk_max": 0.36,
+        "safe_follow_ttc_min_s": 1.8,
+        "safe_follow_ttc_max_s": 5.2,
+        "wait_window_bonus_scale": 0.35,
+        "wait_window_min_gap_m": 0.8,
+        "wait_window_max_gap_m": 2.2,
+        "wait_window_max_closing_rate": 0.12,
+        "force_pass_penalty_scale": 1.18,
+        "unsafe_close_penalty_scale": 0.95,
+        "obstacle_clearance_penalty_scale": 0.9,
+        "obstacle_clearance_inner_m": 0.3,
+        "obstacle_clearance_outer_m": 0.6,
+        "post_pass_cut_in_penalty_scale": 1.1,
+        "post_pass_watch_longitudinal_m": 1.8,
+        "post_pass_watch_steps": 42,
+        "overtake_success_min_progress_ratio": 1e-06,
+        "unsafe_close_gap_m": 0.55,
+        "unsafe_close_clearance_m": 0.3,
+        "unsafe_close_longitudinal_m": 0.5,
+        "lateral_overlap_ref_m": 0.3,
+        "unsafe_close_ttc_s": 2.2,
+        "overtake_arm_longitudinal_min_m": 0.45,
+        "overtake_arm_planar_max_m": 2.6,
+        "overtake_pass_longitudinal_threshold_m": -0.45,
+        "overtake_pass_planar_min_m": 0.6,
+        "close_front_planar_max_m": 2.6,
+        "force_pass_planar_max_m": 2.6
+      },
+      "gt": {
+        "progress_reward_scale": 44.0,
+        "survival_reward_scale": 0.2,
+        "w_speed_ref": 0.07,
+        "speed_ref_vmin": 0.28,
+        "speed_ref_vmax": 0.72,
+        "collision_episode_reward_cap": 82.0,
+        "offtrack_episode_reward_cap": 75.0,
+        "offtrack_leniency_ratio": 0.14,
+        "offtrack_leniency_mult": 1.8,
+        "safe_follow_bonus_scale": 0.25,
+        "safe_follow_min_m": 1.0,
+        "safe_follow_max_m": 1.4,
+        "safe_follow_risk_max": 0.38,
+        "safe_follow_ttc_min_s": 1.6,
+        "safe_follow_ttc_max_s": 5.0,
+        "wait_window_bonus_scale": 0.3,
+        "wait_window_min_gap_m": 1.0,
+        "wait_window_max_gap_m": 3.0,
+        "wait_window_max_closing_rate": 0.14,
+        "force_pass_penalty_scale": 0.86,
+        "unsafe_close_penalty_scale": 0.75,
+        "obstacle_clearance_penalty_scale": 0.7,
+        "obstacle_clearance_inner_m": 0.3,
+        "obstacle_clearance_outer_m": 0.6,
+        "post_pass_cut_in_penalty_scale": 0.85,
+        "post_pass_watch_longitudinal_m": 1.8,
+        "post_pass_watch_steps": 42,
+        "overtake_success_min_progress_ratio": 1e-06,
+        "unsafe_close_gap_m": 0.9,
+        "unsafe_close_clearance_m": 0.3,
+        "unsafe_close_longitudinal_m": 0.5,
+        "lateral_overlap_ref_m": 0.3,
+        "unsafe_close_ttc_s": 2.2,
+        "overtake_arm_longitudinal_min_m": 0.7,
+        "overtake_arm_planar_max_m": 5.0,
+        "overtake_pass_longitudinal_threshold_m": -0.7,
+        "overtake_pass_planar_min_m": 0.7,
+        "close_front_planar_max_m": 5.0,
+        "force_pass_planar_max_m": 5.0
+      }
+    },
+    "terminal_offtrack_progress_scale": 0.0,
+    "bad_episode_guard_min_steps": 320,
+    "bad_episode_guard_reward_floor": -160.0,
+    "bad_episode_guard_cte_over_in_rate": 0.25,
+    "bad_episode_guard_min_forward_progress": 0.35,
+    "bad_episode_guard_penalty": 4.0
+  },
+  "obstacle_runtime": {
+    "enabled": true,
+    "count": 1,
+    "ws_count": null,
+    "free_prob": 0.05,
+    "modes": [
+      "lane_pid"
+    ],
+    "ws_free_prob": 0.05,
+    "spawn_ahead_min_m": 3.5,
+    "spawn_ahead_max_m": 9.0,
+    "min_agent_planar_dist_m": 1.5,
+    "min_agent_arc_dist_m": 3.8,
+    "min_separation_world": 3.0,
+    "lateral_choices": null,
+    "ws_lateral_choices": [
+      0.0,
+      1.0
+    ],
+    "fixed_progress_ratio": null,
+    "fixed_progress_distribution": null,
+    "fixed_progress_gap": null,
+    "fixed_progress_gap_min": null,
+    "fixed_progress_gap_max": null,
+    "progress_min": 0.1,
+    "progress_max": 0.2,
+    "fixed_lateral_ratio": null,
+    "gt_start_exclusion_half_width_m": null,
+    "ws_modes": [
+      "lane_pid"
+    ],
+    "ws_fixed_progress_ratio": null,
+    "ws_fixed_progress_gap": null,
+    "ws_fixed_progress_gap_min": null,
+    "ws_fixed_progress_gap_max": null,
+    "ws_progress_min": 0.4,
+    "ws_progress_max": 0.6,
+    "ws_fixed_lateral_ratio": null,
+    "randomize_non_lane_pid_yaw": false,
+    "lane_pid_speed_gt": 0.45,
+    "lane_pid_speed_ws": 0.45,
+    "lane_pid_lookahead_m": 0.9
+  },
+  "predictive_safety_filter": {
+    "path": null,
+    "mode": "log",
+    "log_path": null,
+    "yaw_thresh": null,
+    "decel_thresh": null
+  },
+  "seed": null,
+  "exp_tag": "v17_postpass_hard_gate_resume_20260509_190133_lane_pid_intro",
+  "interrupted": false,
+  "training_time_hours": 9.22516301135222,
+  "trained_timesteps": 520000,
+  "num_timesteps_total": 1981788,
+  "final_model_zip": "/home/longzhao/mysim_public/models/v17_postpass_hard_gate_resume_20260509_190133/final_model.zip",
+  "final_model_pth": "/home/longzhao/mysim_public/models/v17_postpass_hard_gate_resume_20260509_190133/final_model_policy.pth",
+  "final_learning_rate": 2e-05,
+  "callback_summaries": {
+    "CrashRecoveryCallback": {
+      "rollback_count": 0,
+      "scene_peaks": {
+        "gt": 582.1736472076268,
+        "ws": 506.25609578956613
+      },
+      "last_rollback_step": 0
+    },
+    "CriticCalibrationCallback": {
+      "last_metrics": {
+        "ws_mae": 2.8927996158599854,
+        "gt_mae": 6.51950740814209,
+        "ws_bias": 0.46428006887435913,
+        "gt_bias": 2.0193376541137695,
+        "ws_adv_std": 4.5159912109375,
+        "gt_adv_std": 9.785512924194336,
+        "ws_ev": 0.9449678446198669,
+        "gt_ev": 0.8438849296344646,
+        "mae_ratio": 2.2537016986584257,
+        "adv_std_ratio": 2.1668582747668603,
+        "ev_gap": 0.10108291498540234,
+        "ev_worse": 0.8438849296344646,
+        "ws_count": 1718.0,
+        "gt_count": 2378.0
+      },
+      "consecutive_hits": 0,
+      "dual_heads_active": false
+    },
+    "CurriculumWindowAdvanceCallback": {
+      "stage_name": "lane_pid_intro",
+      "triggered": false,
+      "stop_reason": "max_stage_timesteps_reached",
+      "min_stage_timesteps": 180000,
+      "max_stage_timesteps": 520000,
+      "recent_episodes": 10,
+      "min_success_episodes": 3,
+      "min_soft_laps": 2.0,
+      "min_episode_len": null,
+      "min_progress_ratio_forward_sum": null,
+      "min_reward": null,
+      "max_episode_speed_mean": null,
+      "max_episode_speed_max": null,
+      "require_no_stuck_for_success": true,
+      "required_obstacle_mode": "lane_pid",
+      "max_collision_rate_by_key": {
+        "ws": 0.25,
+        "gt": 0.35
+      },
+      "max_obstacle_clearance_critical_rate_by_key": {
+        "ws": 0.0,
+        "gt": 0.0
+      },
+      "max_obstacle_clearance_band_rate_by_key": {
+        "ws": 0.05,
+        "gt": 0.05
+      },
+      "max_post_pass_cut_in_rate_by_key": {
+        "ws": 0.02,
+        "gt": 0.02
+      },
+      "max_post_pass_terminal_collision_rate_by_key": {
+        "ws": 0.0,
+        "gt": 0.0
+      },
+      "stop_num_timesteps": 1981788,
+      "stop_stage_timesteps": 520000,
+      "window_success_counts": {
+        "ws": 4,
+        "gt": 0
+      },
+      "window_term_collision_rates": {
+        "ws": 0.0,
+        "gt": 0.4
+      },
+      "recent_soft_laps": {
+        "ws": [
+          5.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          5.0,
+          0.0,
+          1.0,
+          5.0,
+          5.0
+        ],
+        "gt": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "recent_gate_success": {
+        "ws": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "gt": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "recent_term_collisions": {
+        "ws": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "gt": [
+          1.0,
+          1.0,
+          0.0,
+          1.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "extra_run_metadata": {
+    "auto_curriculum": {
+      "enabled": true,
+      "stage_name": "lane_pid_intro",
+      "stage_index": 4,
+      "stage_phase": "lane_pid_intro",
+      "stage_budget_timesteps": 520000,
+      "stage_max_timesteps": 520000,
+      "stage_min_timesteps": 180000,
+      "require_gate_success": true,
+      "remaining_before_stage": 1700000,
+      "total_requested_timesteps": 1700000
+    }
+  }
+}
