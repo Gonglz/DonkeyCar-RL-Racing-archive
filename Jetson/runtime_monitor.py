@@ -43,6 +43,10 @@ import numpy as np
 import textwrap
 from datetime import datetime
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 # ============================================================
 # RP2040 串口传感器读取器
 # ============================================================
@@ -259,15 +263,26 @@ class RosLidarReader:
     def __init__(self, topic='/scan',
                  ros_setup='/opt/ros/melodic/setup.bash',
                  workspace_setup='~/catkin_ws/devel/setup.bash',
-                 python_cmd='/usr/bin/python'):
+                 python_cmd='/usr/bin/python',
+                 auto_start_driver=True,
+                 driver_launch='jetracer lidar.launch',
+                 driver_ready_timeout=12.0,
+                 driver_log_dir='~/mycar/monitor_logs'):
         self.topic = topic
         self.ros_setup = ros_setup
         self.workspace_setup = workspace_setup
         self.python_cmd = python_cmd
+        self.auto_start_driver = bool(auto_start_driver)
+        self.driver_launch = str(driver_launch or '').strip()
+        self.driver_ready_timeout = float(driver_ready_timeout)
+        self.driver_log_dir = os.path.expanduser(driver_log_dir)
         self._lock = threading.Lock()
         self._running = False
         self._connected = False
         self._process = None
+        self._driver_process = None
+        self._driver_log_file = None
+        self._driver_log_path = None
         self._stdout_thread = None
         self._stderr_thread = None
         self._data = self._make_default_data()
@@ -357,16 +372,74 @@ class RosLidarReader:
                     continue
         """).strip()
 
+    def _ros_command(self, body):
+        return (
+            f"source {shlex.quote(self.ros_setup)} >/dev/null 2>&1 && "
+            f"if [ -f {self.workspace_setup} ]; then source {self.workspace_setup} >/dev/null 2>&1; fi && "
+            f"{body}"
+        )
+
+    def _topic_available(self):
+        command = self._ros_command("timeout 3 rostopic list")
+        try:
+            output = subprocess.check_output(
+                ['/bin/bash', '-lc', command],
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=5.0,
+            )
+        except Exception:
+            return False
+        return any(line.strip() == self.topic for line in output.splitlines())
+
+    def _start_driver_if_needed(self):
+        if self._topic_available():
+            print(f"   LiDAR topic 已可用: {self.topic}")
+            return True
+        if not self.auto_start_driver or not self.driver_launch:
+            print(f"   LiDAR topic 暂不可用: {self.topic}")
+            return True
+
+        os.makedirs(self.driver_log_dir, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._driver_log_path = os.path.join(self.driver_log_dir, f'lidar_driver_{ts}.log')
+        launch_parts = shlex.split(self.driver_launch)
+        launch_cmd = "roslaunch " + " ".join(shlex.quote(part) for part in launch_parts)
+        command = self._ros_command(launch_cmd)
+        try:
+            self._driver_log_file = open(self._driver_log_path, 'a')
+            self._driver_process = subprocess.Popen(
+                ['/bin/bash', '-lc', command],
+                stdout=self._driver_log_file,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+            print(f"   LiDAR driver 启动中: {self.driver_launch}")
+            print(f"   LiDAR driver 日志: {self._driver_log_path}")
+        except Exception as e:
+            print(f"   LiDAR driver 启动失败: {e}")
+            return False
+
+        deadline = time.time() + max(0.0, self.driver_ready_timeout)
+        while time.time() < deadline:
+            if self._driver_process.poll() is not None:
+                print(f"   LiDAR driver 已退出，查看日志: {self._driver_log_path}")
+                return False
+            if self._topic_available():
+                print(f"   LiDAR topic ready: {self.topic}")
+                return True
+            time.sleep(0.5)
+        print(f"   LiDAR topic 等待超时: {self.topic} ({self.driver_ready_timeout:.1f}s)")
+        return False
+
     def start(self):
         if self._running:
             return True
 
+        self._start_driver_if_needed()
+
         helper_script = self._build_helper_script()
-        command = (
-            f"source {shlex.quote(self.ros_setup)} >/dev/null 2>&1 && "
-            f"if [ -f {self.workspace_setup} ]; then source {self.workspace_setup} >/dev/null 2>&1; fi && "
-            f"{self.python_cmd} -u -c {shlex.quote(helper_script)}"
-        )
+        command = self._ros_command(f"{self.python_cmd} -u -c {shlex.quote(helper_script)}")
 
         try:
             self._process = subprocess.Popen(
@@ -402,6 +475,17 @@ class RosLidarReader:
             self._stdout_thread.join(timeout=1.0)
         if self._stderr_thread:
             self._stderr_thread.join(timeout=1.0)
+        if self._driver_process and self._driver_process.poll() is None:
+            self._driver_process.terminate()
+            try:
+                self._driver_process.wait(timeout=3.0)
+            except Exception:
+                self._driver_process.kill()
+        if self._driver_log_file:
+            try:
+                self._driver_log_file.close()
+            except Exception:
+                pass
         self._connected = False
 
     def _stdout_loop(self):
@@ -482,6 +566,10 @@ class DataCollector:
         'user/throttle',        # 用户油门
         'pilot/angle',          # AI 转向
         'pilot/throttle',       # AI 油门
+        'pilot/inference_latency_ms',  # shadow pilot end-to-end latency
+        'pilot/preprocess_latency_ms', # shadow observation preprocessing latency
+        'pilot/raw_angle',      # raw high-level policy action[0]
+        'pilot/raw_throttle',   # raw high-level policy action[1]
         'angle',                # 最终执行转向
         'throttle',             # 最终执行油门
         'user/mode',            # 驾驶模式
@@ -493,12 +581,18 @@ class DataCollector:
     BASE_CSV_FIELDS = [
         # 基础信息
         'timestamp', 'sample_id', 'frame', 'elapsed_sec', 'loop_dt_ms', 'effective_fps',
+        # deployment metadata
+        'control_mode', 'model_name', 'model_path', 'model_size_MB',
+        'backend', 'input_resolution', 'input_modalities', 'policy_chain',
+        'track_condition', 'run_label',
         # 驾驶模式 & 状态
         'mode', 'recording', 'run_pilot', 'tub_records',
         # 用户输入
         'user_angle', 'user_throttle',
         # AI 输出
         'pilot_angle', 'pilot_throttle',
+        'pilot_inference_latency_ms', 'pilot_preprocess_latency_ms',
+        'pilot_raw_angle', 'pilot_raw_throttle',
         # 最终执行
         'final_angle', 'final_throttle',
         # 转向差异（AI vs 用户）
@@ -544,7 +638,8 @@ class DataCollector:
         'power_in_mw', 'power_gpu_mw', 'power_cpu_mw',
     ]
 
-    def __init__(self, log_path, log_interval=0.5, serial_reader=None, lidar_reader=None):
+    def __init__(self, log_path, log_interval=0.5, serial_reader=None,
+                 lidar_reader=None, metadata=None):
         self.log_path = log_path
         self.log_interval = log_interval
         self.last_log_time = 0
@@ -554,6 +649,7 @@ class DataCollector:
         self.prev_time = self.start_time
         self.serial_reader = serial_reader  # RP2040SerialReader 实例
         self.lidar_reader = lidar_reader
+        self.metadata = dict(metadata or {})
         self.lidar_fields = []
         self.lidar_raw_path = None
         self.lidar_raw_file = None
@@ -793,6 +889,8 @@ class DataCollector:
 
     def run(self, img_arr, user_angle, user_throttle,
             pilot_angle, pilot_throttle,
+            pilot_inference_latency_ms, pilot_preprocess_latency_ms,
+            pilot_raw_angle, pilot_raw_throttle,
             final_angle, final_throttle,
             mode, recording, run_pilot, tub_records):
         """Vehicle 每帧调用一次
@@ -855,6 +953,16 @@ class DataCollector:
             'elapsed_sec':     f'{elapsed:.2f}',
             'loop_dt_ms':      f'{loop_dt * 1000:.1f}',
             'effective_fps':   f'{effective_fps:.1f}',
+            'control_mode':    self.metadata.get('control_mode', 'normal'),
+            'model_name':      self.metadata.get('model_name', ''),
+            'model_path':      self.metadata.get('model_path', ''),
+            'model_size_MB':   self.metadata.get('model_size_MB', ''),
+            'backend':         self.metadata.get('backend', ''),
+            'input_resolution': self.metadata.get('input_resolution', ''),
+            'input_modalities': self.metadata.get('input_modalities', ''),
+            'policy_chain':    self.metadata.get('policy_chain', ''),
+            'track_condition': self.metadata.get('track_condition', ''),
+            'run_label':       self.metadata.get('run_label', ''),
             'mode':            mode or 'unknown',
             'recording':       bool(recording),
             'run_pilot':       bool(run_pilot),
@@ -863,6 +971,10 @@ class DataCollector:
             'user_throttle':   f'{user_throttle or 0:.4f}',
             'pilot_angle':     f'{pilot_angle or 0:.4f}',
             'pilot_throttle':  f'{pilot_throttle or 0:.4f}',
+            'pilot_inference_latency_ms': f'{pilot_inference_latency_ms if pilot_inference_latency_ms is not None else -1:.3f}',
+            'pilot_preprocess_latency_ms': f'{pilot_preprocess_latency_ms if pilot_preprocess_latency_ms is not None else -1:.3f}',
+            'pilot_raw_angle': f'{pilot_raw_angle if pilot_raw_angle is not None else 0:.4f}',
+            'pilot_raw_throttle': f'{pilot_raw_throttle if pilot_raw_throttle is not None else 0:.4f}',
             'final_angle':     f'{final_angle or 0:.4f}',
             'final_throttle':  f'{final_throttle or 0:.4f}',
             'angle_diff':      f'{angle_diff:.4f}',
@@ -942,6 +1054,9 @@ class DataCollector:
                 'sample_id': self.sample_count,
                 'frame': self.frame_count,
                 'elapsed_sec': round(elapsed, 3),
+                'control_mode': self.metadata.get('control_mode', 'normal'),
+                'track_condition': self.metadata.get('track_condition', ''),
+                'run_label': self.metadata.get('run_label', ''),
                 'mode': mode or 'unknown',
                 'recording': bool(recording),
                 'run_pilot': bool(run_pilot),
@@ -951,6 +1066,10 @@ class DataCollector:
                 'user_throttle': float(user_throttle or 0.0),
                 'pilot_angle': float(pilot_angle or 0.0),
                 'pilot_throttle': float(pilot_throttle or 0.0),
+                'pilot_inference_latency_ms': float(pilot_inference_latency_ms or -1.0),
+                'pilot_preprocess_latency_ms': float(pilot_preprocess_latency_ms or -1.0),
+                'pilot_raw_angle': float(pilot_raw_angle or 0.0),
+                'pilot_raw_throttle': float(pilot_raw_throttle or 0.0),
                 'final_angle': float(final_angle or 0.0),
                 'final_throttle': float(final_throttle or 0.0),
                 'lidar': {
@@ -1040,8 +1159,115 @@ class DataCollector:
 # ============================================================
 # Monkey-patch Vehicle.start 注入采集器
 # ============================================================
+class ShadowModeGuard:
+    """Force user/manual mode during shadow deployment."""
+
+    def __init__(self):
+        self._warned = False
+
+    def run(self, mode):
+        if mode and mode != 'user' and not self._warned:
+            print(f"ShadowModeGuard: forcing user/mode from {mode!r} to 'user'")
+            self._warned = True
+        return 'user'
+
+
+class ForceRecording:
+    """Force DonkeyCar recording on for data-collection deployment runs."""
+
+    def run(self, recording=None):
+        return True
+
+
+class DeploymentDurationStopper:
+    """Stop a deployment run after a wall-clock duration."""
+
+    def __init__(self, duration_sec, label='deployment'):
+        self.duration_sec = float(duration_sec)
+        self.label = str(label)
+        self.start_time = time.time()
+        self.vehicle = None
+        self._announced = False
+
+    def run(self):
+        if self.duration_sec <= 0:
+            return
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.duration_sec and self.vehicle is not None:
+            if not self._announced:
+                print(f"DeploymentDurationStopper[{self.label}]: reached {elapsed:.1f}s, stopping vehicle loop")
+                self._announced = True
+            self.vehicle.on = False
+
+
+def _move_last_part_before(vehicle, predicate, fallback_index=None):
+    """Move the most recently added part before the first part matching predicate."""
+    if not vehicle.parts:
+        return
+    entry = vehicle.parts.pop()
+    insert_at = fallback_index if fallback_index is not None else len(vehicle.parts)
+    for idx, part_entry in enumerate(vehicle.parts):
+        if predicate(part_entry):
+            insert_at = idx
+            break
+    vehicle.parts.insert(insert_at, entry)
+
+
+def _move_last_part_before_output(vehicle, output_name, fallback_index=None):
+    """Move the most recently added part before the first producer of output_name."""
+    _move_last_part_before(
+        vehicle,
+        lambda part_entry: output_name in part_entry.get('outputs', []),
+        fallback_index=fallback_index,
+    )
+
+
+def _move_last_part_before_run_condition(vehicle, run_condition, fallback_index=None):
+    """Move the most recently added part before the first part using run_condition."""
+    _move_last_part_before(
+        vehicle,
+        lambda part_entry: part_entry.get('run_condition') == run_condition,
+        fallback_index=fallback_index,
+    )
+
+
+def _write_run_notes_template(log_dir, log_path, metadata, deployment_config):
+    """Create a small editable notes file for report labels and outcomes."""
+    if not deployment_config.get('write_run_notes', True):
+        return None
+
+    notes_path = os.path.join(log_dir, 'run_notes.json')
+    if os.path.exists(notes_path):
+        return notes_path
+
+    notes = {
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+        'csv_log': log_path,
+        'control_mode': metadata.get('control_mode', 'normal'),
+        'track_condition': metadata.get('track_condition', ''),
+        'run_label': metadata.get('run_label', ''),
+        'model_name': metadata.get('model_name', ''),
+        'model_path': metadata.get('model_path', ''),
+        'planned_duration_sec': deployment_config.get('duration_sec'),
+        'obstacle_layout': deployment_config.get('obstacle_layout', ''),
+        'run_outcome': deployment_config.get('run_outcome', 'unknown'),
+        'collision_or_contact': deployment_config.get('collision_or_contact'),
+        'stuck_detected': deployment_config.get('stuck_detected'),
+        'obstacle_recovery_success': deployment_config.get('obstacle_recovery_success', 'unknown'),
+        'notes': deployment_config.get('notes', ''),
+    }
+    with open(notes_path, 'w') as f:
+        json.dump(notes, f, indent=2, sort_keys=True)
+        f.write('\n')
+    return notes_path
+
+
 def install_monitor(log_dir, log_interval, serial_port='/dev/ttyACM0',
-                    lidar_topic='/scan', enable_lidar=True):
+                    lidar_topic='/scan', enable_lidar=True,
+                    lidar_auto_start_driver=True,
+                    lidar_launch='jetracer lidar.launch',
+                    lidar_ready_timeout=12.0,
+                    shadow_config=None):
     """
     Monkey-patch dk.vehicle.Vehicle.start，在 Vehicle 真正启动前
     自动注入 DataCollector Part 和 RP2040 串口读取器。
@@ -1056,9 +1282,20 @@ def install_monitor(log_dir, log_interval, serial_port='/dev/ttyACM0',
     lidar_reader = None
     lidar_ok = False
     if enable_lidar:
-        lidar_reader = RosLidarReader(topic=lidar_topic)
+        lidar_reader = RosLidarReader(
+            topic=lidar_topic,
+            auto_start_driver=lidar_auto_start_driver,
+            driver_launch=lidar_launch,
+            driver_ready_timeout=lidar_ready_timeout,
+            driver_log_dir=log_dir,
+        )
         lidar_ok = lidar_reader.start()
 
+    shadow_config = dict(shadow_config or {})
+    control_mode = shadow_config.get(
+        'control_mode',
+        'shadow' if shadow_config.get('enabled') else 'normal',
+    )
     _original_start = Vehicle.start
 
     def _patched_start(self, rate_hz=10, max_loop_count=None, verbose=False):
@@ -1067,10 +1304,91 @@ def install_monitor(log_dir, log_interval, serial_port='/dev/ttyACM0',
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f'run_{ts}.csv')
 
+        shadow_metadata = {}
+        if shadow_config.get('enabled'):
+            model_path = shadow_config.get('model_path')
+            if not model_path:
+                raise ValueError(f"{control_mode} mode requires --model or --shadow-model")
+
+            if control_mode == 'shadow':
+                self.add(ShadowModeGuard(),
+                         inputs=['user/mode'],
+                         outputs=['user/mode'],
+                         threaded=False)
+                _move_last_part_before_output(self, 'run_pilot', fallback_index=0)
+
+            from v17_pilot import V17Pilot
+            deployment_pilot = V17Pilot(
+                model_path=model_path,
+                obs_size=shadow_config.get('obs_size', 128),
+                state_dim=shadow_config.get('state_dim'),
+                domain=shadow_config.get('domain', 'ws'),
+                max_throttle=shadow_config.get('max_throttle', 0.8),
+                delta_max=shadow_config.get('delta_max', 0.35),
+                enable_lpf=shadow_config.get('enable_lpf', True),
+                beta=shadow_config.get('beta', 0.6),
+                use_cuda=shadow_config.get('use_cuda', True),
+                serial_reader=serial_reader if serial_ok else None,
+                lidar_reader=lidar_reader if lidar_ok else None,
+                warmup_frames=shadow_config.get('warmup_frames', 5),
+            )
+            shadow_metadata = deployment_pilot.metadata
+            shadow_metadata.update({
+                'control_mode': control_mode,
+                'track_condition': shadow_config.get('track_condition', ''),
+                'run_label': shadow_config.get('run_label', ''),
+            })
+            self.add(deployment_pilot,
+                     inputs=['cam/image_array', 'user/angle', 'user/throttle',
+                             'angle', 'throttle'],
+                     outputs=['pilot/angle', 'pilot/throttle',
+                              'pilot/inference_latency_ms',
+                              'pilot/raw_angle', 'pilot/raw_throttle',
+                              'pilot/preprocess_latency_ms'],
+                     threaded=False)
+            if control_mode == 'active':
+                _move_last_part_before(
+                    self,
+                    lambda part_entry: (
+                        'angle' in part_entry.get('outputs', []) or
+                        (
+                            'pilot/throttle' in part_entry.get('inputs', []) and
+                            'pilot/throttle' in part_entry.get('outputs', [])
+                        )
+                    ),
+                    fallback_index=len(self.parts),
+                )
+
+            if shadow_config.get('force_recording'):
+                self.add(ForceRecording(),
+                         inputs=['recording'],
+                         outputs=['recording'],
+                         threaded=False)
+                _move_last_part_before_run_condition(
+                    self, 'recording', fallback_index=len(self.parts)
+                )
+
+            duration = shadow_config.get('duration_sec')
+            if duration:
+                stopper = DeploymentDurationStopper(duration, label=control_mode)
+                stopper.vehicle = self
+                self.add(stopper, inputs=[], outputs=[], threaded=False)
+            notes_path = _write_run_notes_template(
+                log_dir, log_path, shadow_metadata, shadow_config
+            )
+            if control_mode == 'active':
+                print("V17 active pilot injected; local mode uses V17 pilot outputs")
+                print("   Safety: switch back to user mode for manual override")
+            else:
+                print("V17 shadow pilot injected; actuator path remains user/manual")
+            if notes_path:
+                print(f"   Run notes: {notes_path}")
+
         # 创建并注入采集器（带串口读取器）
         collector = DataCollector(log_path=log_path, log_interval=log_interval,
                                   serial_reader=serial_reader if serial_ok else None,
-                                  lidar_reader=lidar_reader if lidar_ok else None)
+                                  lidar_reader=lidar_reader if lidar_ok else None,
+                                  metadata=shadow_metadata)
         collector.vehicle = self
         self.add(collector,
                  inputs=DataCollector.INPUT_KEYS,
@@ -1107,13 +1425,15 @@ def main():
 示例:
   python runtime_monitor.py drive --model ~/mycar/models/v8_140000_steps_policy.pth --type v8
   python runtime_monitor.py drive --model xxx --type v8 --js --log-interval 0.2
+  python runtime_monitor.py drive --model ~/mycar/models/v17_latest.zip --type v17 --control-mode shadow --js
+  python runtime_monitor.py drive --model ~/mycar/models/v17_latest.zip --type v17 --control-mode active --js
   python runtime_monitor.py drive  # 手动模式，仅采集用户操作 + 系统数据
         """)
 
     parser.add_argument('command', choices=['drive'], help='运行命令')
     parser.add_argument('--model', type=str, default=None, help='模型文件路径')
     parser.add_argument('--type', type=str, default=None,
-                        choices=['linear', 'categorical', 'v8'],
+                        choices=['linear', 'categorical', 'v8', 'v17'],
                         help='模型类型')
     parser.add_argument('--js', action='store_true', help='使用物理手柄')
     parser.add_argument('--myconfig', type=str, default='myconfig.py',
@@ -1125,7 +1445,7 @@ def main():
     parser.add_argument('--log-interval', type=float, default=0.5,
                         help='日志写入间隔(秒), 默认 0.5')
     parser.add_argument('--log-dir', type=str,
-                        default=os.path.expanduser('~/mycar/monitor_logs'),
+                        default=None,
                         help='日志输出目录')
     parser.add_argument('--serial-port', type=str, default='/dev/ttyACM0',
                         help='RP2040 串口设备 (默认 /dev/ttyACM0)')
@@ -1133,8 +1453,89 @@ def main():
                         help='LiDAR LaserScan topic (默认 /scan)')
     parser.add_argument('--disable-lidar', action='store_true',
                         help='禁用 LiDAR 采集')
+    parser.add_argument('--no-start-lidar-driver', action='store_true',
+                        help='不自动启动 ROS LiDAR driver，仅订阅已有 topic')
+    parser.add_argument('--lidar-launch', type=str, default='jetracer lidar.launch',
+                        help='自动启动的 roslaunch 目标，例如 "jetracer lidar.launch"')
+    parser.add_argument('--lidar-ready-timeout', type=float, default=12.0,
+                        help='等待 LiDAR /scan topic ready 的秒数')
+    parser.add_argument('--control-mode', type=str, default='normal',
+                        choices=['normal', 'shadow', 'active'],
+                        help='normal 使用 manage.py 默认控制; shadow 只记录 pilot 输出; active 由 V17 接管 local 模式')
+    parser.add_argument('--shadow-model', type=str, default=None,
+                        help='shadow pilot 模型路径；默认复用 --model')
+    parser.add_argument('--shadow-duration', type=float, default=None,
+                        help='shadow run 秒数；例如 30 smoke 或 180 正式采集')
+    parser.add_argument('--active-duration', type=float, default=180.0,
+                        help='active run 秒数；例如 180 实地采集')
+    parser.add_argument('--shadow-obs-size', type=int, default=128,
+                        help='V17 observation image size, default 128')
+    parser.add_argument('--shadow-state-dim', type=int, default=None,
+                        help='V17 state dim override; 默认从模型推断或 7')
+    parser.add_argument('--shadow-domain', type=str, default='ws',
+                        choices=['ws', 'gt', 'rrl', 'generic'],
+                        help='CanonicalSemanticWrapper domain, default ws')
+    parser.add_argument('--shadow-max-throttle', type=float, default=0.8,
+                        help='ActionAdapter throttle clamp, default 0.8')
+    parser.add_argument('--shadow-delta-max', type=float, default=0.35,
+                        help='ActionSafety steering delta_max, default 0.35')
+    parser.add_argument('--shadow-beta', type=float, default=0.6,
+                        help='ActionSafety LPF beta, default 0.6')
+    parser.add_argument('--shadow-disable-lpf', action='store_true',
+                        help='禁用 ActionSafety LPF')
+    parser.add_argument('--shadow-cpu', action='store_true',
+                        help='强制 V17 shadow pilot 使用 CPU')
+    parser.add_argument('--shadow-warmup-frames', type=int, default=5,
+                        help='V17 pilot warmup frames before logging')
+    parser.add_argument('--track-condition', type=str, default='',
+                        help='报告场景标签，例如 obstacle_recovery')
+    parser.add_argument('--run-label', type=str, default='',
+                        help='报告 run 标签，例如 v17_active_obstacle_run1')
+    parser.add_argument('--force-recording', dest='force_recording',
+                        action='store_true', default=None,
+                        help='强制 recording=True，active 默认开启')
+    parser.add_argument('--no-force-recording', dest='force_recording',
+                        action='store_false',
+                        help='关闭强制 recording')
+    parser.add_argument('--obstacle-layout', type=str, default='',
+                        help='run_notes.json 中的障碍布局描述')
+    parser.add_argument('--run-outcome', type=str, default='unknown',
+                        choices=['unknown', 'completed', 'manual_override',
+                                 'collision', 'stuck', 'timeout'],
+                        help='run_notes.json 中的人工结果标签，可事后修改')
+    parser.add_argument('--collision-or-contact', action='store_true',
+                        default=None,
+                        help='标记本 run 发生碰撞或接触')
+    parser.add_argument('--stuck-detected', action='store_true',
+                        default=None,
+                        help='标记本 run 发生卡死')
+    parser.add_argument('--obstacle-recovery-success', type=str,
+                        default='unknown',
+                        choices=['unknown', 'true', 'false'],
+                        help='障碍恢复是否成功，可事后修改')
+    parser.add_argument('--notes', type=str, default='',
+                        help='写入 run_notes.json 的自由文本备注')
 
     args = parser.parse_args()
+    default_log_dir = os.path.expanduser('~/mycar/monitor_logs')
+    log_dir = args.log_dir
+    if log_dir is None:
+        if args.control_mode == 'active':
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            condition = args.track_condition or 'obstacle_recovery'
+            safe_condition = ''.join(
+                ch if ch.isalnum() or ch in ('-', '_') else '_'
+                for ch in condition
+            ).strip('_') or 'field'
+            log_dir = os.path.join(
+                default_log_dir, f'v17_active_{safe_condition}_{stamp}'
+            )
+        else:
+            log_dir = default_log_dir
+    args.log_dir = os.path.expanduser(log_dir)
+
+    if args.force_recording is None:
+        args.force_recording = args.control_mode == 'active'
 
     print("\n" + "=" * 60)
     print("DonkeyCar Runtime Monitor + RP2040 Sensor Bridge")
@@ -1146,6 +1547,9 @@ def main():
     print(f"   日志目录: {args.log_dir}")
     print(f"   RP2040 串口: {args.serial_port}")
     print(f"   LiDAR: {'关闭' if args.disable_lidar else f'{args.lidar_topic} (raw /scan)'}")
+    print(f"   控制模式: {args.control_mode}")
+    print(f"   场景标签: {args.track_condition or '未设置'}")
+    print(f"   强制录制: {args.force_recording}")
     print("=" * 60 + "\n")
 
     import donkeycar as dk
@@ -1154,17 +1558,58 @@ def main():
     # 禁用 DonkeyCar 自带的 IMU/编码器 Part（传感器数据由 RP2040 串口提供）
     cfg.HAVE_IMU = False
     cfg.HAVE_ODOM = False
+    if args.control_mode == 'active' and args.force_recording:
+        cfg.RECORD_DURING_AI = True
+        cfg.AUTO_CREATE_NEW_TUB = True
+
+    shadow_model = args.shadow_model or args.model
+    deployment_enabled = args.control_mode in ('shadow', 'active')
+    shadow_enabled = args.control_mode == 'shadow'
+    active_enabled = args.control_mode == 'active'
+    if deployment_enabled and not shadow_model:
+        raise ValueError(f"--control-mode {args.control_mode} requires --model or --shadow-model")
+    duration_sec = args.active_duration if active_enabled else args.shadow_duration
+    shadow_config = {
+        'enabled': deployment_enabled,
+        'control_mode': args.control_mode,
+        'model_path': shadow_model,
+        'duration_sec': duration_sec,
+        'obs_size': args.shadow_obs_size,
+        'state_dim': args.shadow_state_dim,
+        'domain': args.shadow_domain,
+        'max_throttle': args.shadow_max_throttle,
+        'delta_max': args.shadow_delta_max,
+        'enable_lpf': not args.shadow_disable_lpf,
+        'beta': args.shadow_beta,
+        'use_cuda': not args.shadow_cpu,
+        'warmup_frames': args.shadow_warmup_frames,
+        'track_condition': args.track_condition,
+        'run_label': args.run_label,
+        'force_recording': args.force_recording,
+        'obstacle_layout': args.obstacle_layout,
+        'run_outcome': args.run_outcome,
+        'collision_or_contact': args.collision_or_contact,
+        'stuck_detected': args.stuck_detected,
+        'obstacle_recovery_success': args.obstacle_recovery_success,
+        'notes': args.notes,
+    }
 
     install_monitor(log_dir=args.log_dir, log_interval=args.log_interval,
                     serial_port=args.serial_port,
                     lidar_topic=args.lidar_topic,
-                    enable_lidar=not args.disable_lidar)
+                    enable_lidar=not args.disable_lidar,
+                    lidar_auto_start_driver=not args.no_start_lidar_driver,
+                    lidar_launch=args.lidar_launch,
+                    lidar_ready_timeout=args.lidar_ready_timeout,
+                    shadow_config=shadow_config)
 
     from manage import drive
+    drive_model_path = None if deployment_enabled and args.type == 'v17' else args.model
+    drive_model_type = None if deployment_enabled and args.type == 'v17' else args.type
     drive(cfg,
-          model_path=args.model,
+          model_path=drive_model_path,
           use_joystick=args.js,
-          model_type=args.type,
+          model_type=drive_model_type,
           camera_type='single',
           meta=args.meta or [])
 
