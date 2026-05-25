@@ -3,7 +3,7 @@
 日期：2026-05-25
 Jetson：`jetson@192.168.1.176`
 实验目录：`/home/jetson/mycar/monitor_logs/v17_p0_hardening_20260525_011504`
-工具代码 commit：`168cd319149353f010c8d66679276fbf50e013db`
+manifest source commit：`168cd319149353f010c8d66679276fbf50e013db`
 
 ## 1. 结论
 
