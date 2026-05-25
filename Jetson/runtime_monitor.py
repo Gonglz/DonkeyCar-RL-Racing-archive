@@ -737,22 +737,50 @@ class AsyncLogWriter:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._pending = 0
         self._last_flush = time.time()
+        self.max_queue_size = int(max(1, max_queue))
+        self.max_queue_depth = 0
         self.dropped_records = 0
+        self.records_written = 0
+        self.raw_records_written = 0
+        self._stats_lock = threading.Lock()
         self._thread.start()
+
+    def _note_queue_depth(self, depth):
+        with self._stats_lock:
+            if int(depth) > self.max_queue_depth:
+                self.max_queue_depth = int(depth)
+
+    def stats(self):
+        with self._stats_lock:
+            return {
+                'queue_depth': int(self._queue.qsize()),
+                'max_queue_depth': int(self.max_queue_depth),
+                'max_queue_size': int(self.max_queue_size),
+                'dropped_records': int(self.dropped_records),
+                'records_written': int(self.records_written),
+                'raw_records_written': int(self.raw_records_written),
+            }
 
     def write(self, row, raw_record=None):
         item = (row, raw_record)
         try:
             self._queue.put_nowait(item)
+            self._note_queue_depth(self._queue.qsize())
         except queue.Full:
             # Preserve control-loop liveness under logging pressure. Dropping a
             # debug sample is preferable to blocking the vehicle loop.
-            self.dropped_records += 1
+            with self._stats_lock:
+                self.dropped_records += 1
+                self.max_queue_depth = max(self.max_queue_depth, self.max_queue_size)
 
     def _write_item(self, row, raw_record):
         self.csv_writer.writerow(row)
         if self.raw_file is not None and raw_record is not None:
             self.raw_file.write(json.dumps(raw_record, separators=(',', ':')) + '\n')
+        with self._stats_lock:
+            self.records_written += 1
+            if self.raw_file is not None and raw_record is not None:
+                self.raw_records_written += 1
         self._pending += 1
 
     def _flush_if_needed(self, force=False):
@@ -877,6 +905,11 @@ class DataCollector:
         'safety_lidar_missing_count', 'safety_lidar_stale_count',
         'safety_rp2040_missing_count',
         'safety_last_lidar_age_ms', 'safety_last_rp2040_age_ms',
+        # shadow actuator route evidence
+        'actual_actuator_source', 'v17_output_route',
+        'shadow_action_angle', 'shadow_action_throttle',
+        'vehicle_action_angle', 'vehicle_action_throttle',
+        'shadow_non_takeover',
         # 用户输入
         'user_angle', 'user_throttle',
         # AI 输出
@@ -915,6 +948,12 @@ class DataCollector:
         # 内存 & 交换
         'mem_used_mb', 'mem_total_mb', 'mem_used_pct',
         'swap_used_mb', 'swap_total_mb',
+        'process_rss_mb',
+        # Async DataCollector writer health
+        'async_queue_depth', 'async_queue_max_depth',
+        'async_writer_backlog', 'async_writer_max_backlog',
+        'async_writer_dropped_records',
+        'async_writer_records_written', 'async_writer_raw_records_written',
         # 磁盘
         'disk_used_pct',
         # 风扇
@@ -940,6 +979,9 @@ class DataCollector:
         self.serial_reader = serial_reader  # RP2040SerialReader 实例
         self.lidar_reader = lidar_reader
         self.metadata = dict(metadata or {})
+        self.process_rss_mb_start = self._read_process_rss_mb()
+        self.process_rss_mb_max = self.process_rss_mb_start
+        self.async_writer_stats_path = None
         self.lidar_fields = []
         self.lidar_raw_path = None
         self.lidar_raw_file = None
@@ -1034,6 +1076,19 @@ class DataCollector:
                     round(swap_used / 1024, 1), round(swap_total / 1024, 1))
         except Exception:
             return -1.0, -1.0, -1.0, -1.0, -1.0
+
+    def _read_process_rss_mb(self):
+        """Read this process RSS from /proc/self/status without psutil."""
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return round(int(parts[1]) / 1024.0, 3)
+        except Exception:
+            pass
+        return -1.0
 
     def _read_wifi(self):
         """读取 WiFi RSSI 和链路质量，返回 (rssi_dbm, link_quality)"""
@@ -1273,6 +1328,12 @@ class DataCollector:
 
         # -- 系统数据 --
         temps = self._read_thermal_zones()
+        process_rss_mb = self._read_process_rss_mb()
+        if process_rss_mb >= 0:
+            if self.process_rss_mb_max is None or self.process_rss_mb_max < 0:
+                self.process_rss_mb_max = process_rss_mb
+            else:
+                self.process_rss_mb_max = max(self.process_rss_mb_max, process_rss_mb)
 
         # -- 计算值 --
         angle_diff = 0.0
@@ -1280,6 +1341,25 @@ class DataCollector:
             angle_diff = (pilot_angle or 0) - (user_angle or 0)
 
         effective_fps = self.frame_count / elapsed if elapsed > 0 else 0
+        control_mode = self.metadata.get('control_mode', 'normal')
+        mode_text = mode or 'unknown'
+        run_pilot_bool = bool(run_pilot)
+        shadow_action_angle = float(pilot_angle or 0.0)
+        shadow_action_throttle = float(pilot_throttle or 0.0)
+        vehicle_action_angle = float(final_angle or 0.0)
+        vehicle_action_throttle = float(final_throttle or 0.0)
+        if control_mode == 'shadow':
+            actual_actuator_source = 'user/manual'
+            v17_output_route = 'shadow_only'
+            shadow_non_takeover = not run_pilot_bool
+        elif control_mode == 'active':
+            actual_actuator_source = 'v17_active'
+            v17_output_route = 'active_actuator'
+            shadow_non_takeover = False
+        else:
+            actual_actuator_source = 'donkeycar_default'
+            v17_output_route = 'normal'
+            shadow_non_takeover = False
 
         # -- 写入 CSV --
         row = {
@@ -1289,7 +1369,7 @@ class DataCollector:
             'elapsed_sec':     f'{elapsed:.2f}',
             'loop_dt_ms':      f'{loop_dt * 1000:.1f}',
             'effective_fps':   f'{effective_fps:.1f}',
-            'control_mode':    self.metadata.get('control_mode', 'normal'),
+            'control_mode':    control_mode,
             'model_name':      self.metadata.get('model_name', ''),
             'model_path':      self.metadata.get('model_path', ''),
             'model_size_MB':   self.metadata.get('model_size_MB', ''),
@@ -1299,9 +1379,9 @@ class DataCollector:
             'policy_chain':    self.metadata.get('policy_chain', ''),
             'track_condition': self.metadata.get('track_condition', ''),
             'run_label':       self.metadata.get('run_label', ''),
-            'mode':            mode or 'unknown',
+            'mode':            mode_text,
             'recording':       bool(recording),
-            'run_pilot':       bool(run_pilot),
+            'run_pilot':       run_pilot_bool,
             'tub_records':     tub_records or 0,
             'safety_blocked':   bool(safety_blocked),
             'safety_block_reason': safety_block_reason or '',
@@ -1311,6 +1391,13 @@ class DataCollector:
             'safety_rp2040_missing_count': int(safety_rp2040_missing_count or 0),
             'safety_last_lidar_age_ms': f'{safety_last_lidar_age_ms if safety_last_lidar_age_ms is not None else -1:.1f}',
             'safety_last_rp2040_age_ms': f'{safety_last_rp2040_age_ms if safety_last_rp2040_age_ms is not None else -1:.1f}',
+            'actual_actuator_source': actual_actuator_source,
+            'v17_output_route': v17_output_route,
+            'shadow_action_angle': f'{shadow_action_angle:.4f}',
+            'shadow_action_throttle': f'{shadow_action_throttle:.4f}',
+            'vehicle_action_angle': f'{vehicle_action_angle:.4f}',
+            'vehicle_action_throttle': f'{vehicle_action_throttle:.4f}',
+            'shadow_non_takeover': bool(shadow_non_takeover),
             'user_angle':      f'{user_angle or 0:.4f}',
             'user_throttle':   f'{user_throttle or 0:.4f}',
             'pilot_angle':     f'{pilot_angle or 0:.4f}',
@@ -1364,6 +1451,14 @@ class DataCollector:
             'mem_used_pct':    f'{temps["mem_used_pct"]:.1f}',
             'swap_used_mb':    f'{temps["swap_used_mb"]:.0f}',
             'swap_total_mb':   f'{temps["swap_total_mb"]:.0f}',
+            'process_rss_mb':  f'{process_rss_mb:.3f}',
+            'async_queue_depth': 0,
+            'async_queue_max_depth': 0,
+            'async_writer_backlog': 0,
+            'async_writer_max_backlog': 0,
+            'async_writer_dropped_records': 0,
+            'async_writer_records_written': 0,
+            'async_writer_raw_records_written': 0,
             'disk_used_pct':   f'{temps["disk_used_pct"]:.1f}',
             'fan_pwm':         temps['fan_pwm'],
             'wifi_rssi_dbm':   f'{temps["wifi_rssi_dbm"]:.0f}',
@@ -1425,6 +1520,15 @@ class DataCollector:
                 'pilot_raw_throttle': float(pilot_raw_throttle or 0.0),
                 'final_angle': float(final_angle or 0.0),
                 'final_throttle': float(final_throttle or 0.0),
+                'actuator_route': {
+                    'actual_actuator_source': actual_actuator_source,
+                    'v17_output_route': v17_output_route,
+                    'shadow_action_angle': shadow_action_angle,
+                    'shadow_action_throttle': shadow_action_throttle,
+                    'vehicle_action_angle': vehicle_action_angle,
+                    'vehicle_action_throttle': vehicle_action_throttle,
+                    'shadow_non_takeover': bool(shadow_non_takeover),
+                },
                 'lidar': {
                     'frame_count': ld.get('frame_count', 0),
                     'stamp': ld.get('last_update', 0.0),
@@ -1441,6 +1545,33 @@ class DataCollector:
                     'intensities': ld.get('intensities', []),
                 },
             }
+        async_stats = self.async_writer.stats()
+        predicted_queue_depth = min(
+            int(async_stats.get('max_queue_size', 0) or 0),
+            int(async_stats.get('queue_depth', 0) or 0) + 1,
+        )
+        predicted_max_queue_depth = max(
+            int(async_stats.get('max_queue_depth', 0) or 0),
+            predicted_queue_depth,
+        )
+        row.update({
+            'async_queue_depth': predicted_queue_depth,
+            'async_queue_max_depth': predicted_max_queue_depth,
+            'async_writer_backlog': predicted_queue_depth,
+            'async_writer_max_backlog': predicted_max_queue_depth,
+            'async_writer_dropped_records': int(async_stats.get('dropped_records', 0) or 0),
+            'async_writer_records_written': int(async_stats.get('records_written', 0) or 0),
+            'async_writer_raw_records_written': int(async_stats.get('raw_records_written', 0) or 0),
+        })
+        if raw_record is not None:
+            raw_record['async_writer'] = {
+                'queue_depth': predicted_queue_depth,
+                'max_queue_depth': predicted_max_queue_depth,
+                'dropped_records': int(async_stats.get('dropped_records', 0) or 0),
+                'records_written': int(async_stats.get('records_written', 0) or 0),
+                'raw_records_written': int(async_stats.get('raw_records_written', 0) or 0),
+            }
+            raw_record['process_rss_mb'] = process_rss_mb
         self.async_writer.write(row, raw_record)
 
         # 终端摘要（每60条打印一次）
@@ -1484,8 +1615,33 @@ class DataCollector:
     def shutdown(self):
         if hasattr(self, 'async_writer') and self.async_writer:
             self.async_writer.close()
+            writer_stats = self.async_writer.stats()
+        else:
+            writer_stats = {}
         if hasattr(self, '_telemetry_cache') and self._telemetry_cache:
             self._telemetry_cache.stop()
+        process_rss_mb_end = self._read_process_rss_mb()
+        if process_rss_mb_end >= 0:
+            if self.process_rss_mb_max is None or self.process_rss_mb_max < 0:
+                self.process_rss_mb_max = process_rss_mb_end
+            else:
+                self.process_rss_mb_max = max(self.process_rss_mb_max, process_rss_mb_end)
+        try:
+            stats_payload = {
+                'created_at': datetime.now().isoformat(timespec='seconds'),
+                'log_path': self.log_path,
+                'process_rss_mb_start': self.process_rss_mb_start,
+                'process_rss_mb_end': process_rss_mb_end,
+                'process_rss_mb_max': self.process_rss_mb_max,
+                'async_writer': writer_stats,
+            }
+            log_stem, _ = os.path.splitext(self.log_path)
+            self.async_writer_stats_path = f'{log_stem}_async_writer_stats.json'
+            with open(self.async_writer_stats_path, 'w') as f:
+                json.dump(stats_payload, f, indent=2, sort_keys=True)
+                f.write('\n')
+        except Exception as exc:
+            print(f"   Async writer stats 写入失败: {exc}")
         self.csv_file.close()
         if self.lidar_raw_file:
             self.lidar_raw_file.close()
@@ -1509,8 +1665,13 @@ class DataCollector:
         print(f"   日志已保存: {self.log_path}")
         if self.lidar_raw_path:
             print(f"   LiDAR Raw: {self.lidar_raw_path}")
-        if hasattr(self, 'async_writer') and self.async_writer.dropped_records:
-            print(f"   日志丢弃样本: {self.async_writer.dropped_records}")
+        if self.async_writer_stats_path:
+            print(f"   Async writer stats: {self.async_writer_stats_path}")
+        if writer_stats:
+            print(f"   Async queue max depth: {writer_stats.get('max_queue_depth', 0)}/{writer_stats.get('max_queue_size', 0)}")
+            print(f"   Async records written: csv={writer_stats.get('records_written', 0)}, raw={writer_stats.get('raw_records_written', 0)}")
+            print(f"   日志丢弃样本: {writer_stats.get('dropped_records', 0)}")
+            print(f"   Process RSS MB: start={self.process_rss_mb_start:.3f}, end={process_rss_mb_end:.3f}, max={self.process_rss_mb_max:.3f}")
         print(f"{'='*60}\n")
 
 

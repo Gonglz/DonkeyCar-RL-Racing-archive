@@ -205,10 +205,10 @@ final 20min run 已补：
 - replay diff 使用固定 seed 合法 shape/range obs，不声称覆盖真实视觉分布；它验证的是 actor 数值一致性和 LSTM 连续状态一致性。
 - final 20min waterfall 只使用已有字段，不补造 camera/semantic 内部分段。
 
-## 8. P1 Backlog 保留
+## 8. P1 Backlog 状态
 
 - 60min shadow burn-in。
-- Async queue depth / dropped sample summary。
-- Engine/metadata mismatch negative tests。
-- Shadow non-takeover CSV 显式字段。
+- Async queue depth / dropped sample summary：已在 `docs/v17_endpoint_deployment_p1_evidence_result_2026-05-25.md` 完成。
+- Engine/metadata mismatch negative tests：已在 `docs/v17_endpoint_deployment_p1_evidence_result_2026-05-25.md` 完成。
+- Shadow non-takeover CSV 显式字段：已在 `docs/v17_endpoint_deployment_p1_evidence_result_2026-05-25.md` 完成。
 - LiDAR header age / receipt age / sectorization age 拆分。

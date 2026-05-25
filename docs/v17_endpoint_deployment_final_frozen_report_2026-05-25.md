@@ -30,10 +30,13 @@ Jetson：`jetson@192.168.1.176`
 - RP2040 missing fail-fast。
 - inference timeout 计数与 summary 字段。
 - DataCollector 异步写入。
+- Async queue/RSS summary，证明异步写入没有在 P1 180s shadow 中形成后台堆积。
 - telemetry cache。
 - shadow non-takeover：shadow 模式只记录 V17 输出，不接管 actuator。
+- CSV shadow non-takeover 显式字段：`actual_actuator_source=user/manual`、`v17_output_route=shadow_only`。
 - 180s x3、10min x2、20min x1 TensorRT shadow 证据。
 - P0 hardening 证据：1000-sample continuous LSTM replay diff、final 20min latency waterfall、runtime LiDAR freeze/drop 注入、active safety mock、reproducibility manifest。
+- P1 evidence 证据：Async queue/RSS、CSV shadow non-takeover、engine/metadata mismatch negative tests。
 
 ## 3. 最终 20min TensorRT Shadow 复现实验
 
@@ -126,11 +129,24 @@ DataCollector p99 为 9.87ms，仍低于 20ms 目标线。
 |---|---|
 | engine missing | Vehicle loop 前 exit 2，写 `preflight_report.json` |
 | metadata missing | Vehicle loop 前 exit 2，写 `preflight_report.json` |
+| metadata mismatch：`lidar_dim=72` | Vehicle loop 前 exit 2，未进入 Vehicle.start |
+| metadata / engine mismatch：`lstm_hidden_size=128` | Vehicle loop 前 exit 2，binding shape mismatch |
+| metadata missing input/output | Vehicle loop 前 exit 2，missing inputs / outputs |
 | RP2040 missing + `require_rp2040` | Vehicle loop 前 exit 2，无 `/dev/ttyACM0` 旁路 |
 | LiDAR disabled + `require_lidar` | Vehicle loop 前 exit 2 |
 | LiDAR stale + `max_lidar_age_ms=350` | 收到 stale scan 后 Vehicle loop 前 exit 2 |
 | inference timeout counter | shadow 中可计数，active 中可触发安全输出/停 loop |
-| shadow non-takeover | 多轮 shadow 均保持 user/manual，不接管 actuator |
+| shadow non-takeover | CSV 显式记录 `user/manual` + `shadow_only`，P1 180s 中 301/301 行通过 |
+
+P1 180s TensorRT shadow 补充证据：
+
+| 指标 | 数值 |
+|---|---:|
+| async queue max depth | 1 |
+| async writer backlog final | 0 |
+| async writer dropped records | 0 |
+| process RSS start/end/max MB | 2360.789 / 2312.117 / 2363.199 |
+| shadow non-takeover failures | 0 |
 
 ## 6. PMIC 100C 结论
 
@@ -159,6 +175,7 @@ tegrastats: PMIC@100C
 - 端侧部署完整记录：`docs/v17_endpoint_deployment_complete_record_2026-05-25.md`
 - P0 safety gate 报告：`docs/v17_p0_safety_gate_implementation_result_2026-05-24.md`
 - P0 证据补强报告：`docs/v17_endpoint_deployment_p0_hardening_result_2026-05-25.md`
+- P1 证据补强报告：`docs/v17_endpoint_deployment_p1_evidence_result_2026-05-25.md`
 - LiDAR stale / PMIC 核查报告：`docs/v17_lidar_stale_pmic_validation_2026-05-24.md`
 - 部署验证执行结果：`docs/v17_endpoint_deployment_validation_result_2026-05-24.md`
 - 视觉前端独立分析：`docs/v17_vision_frontend_separate_analysis_2026-05-24.md`

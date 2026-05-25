@@ -30,6 +30,11 @@ CSV_METRICS = [
     "safety_lidar_missing_count",
     "safety_lidar_stale_count",
     "safety_rp2040_missing_count",
+    "process_rss_mb",
+    "async_queue_depth",
+    "async_queue_max_depth",
+    "async_writer_backlog",
+    "async_writer_dropped_records",
 ]
 
 
@@ -113,7 +118,24 @@ def csv_metrics(csv_rows: List[Dict[str, str]]) -> Dict[str, Dict[str, object]]:
         }
 
     modes = sorted(set(str(row.get("mode", "")).strip() for row in csv_rows if row.get("mode")))
+    control_modes = sorted(set(str(row.get("control_mode", "")).strip() for row in csv_rows if row.get("control_mode")))
+    actuator_sources = sorted(set(str(row.get("actual_actuator_source", "")).strip() for row in csv_rows if row.get("actual_actuator_source")))
+    output_routes = sorted(set(str(row.get("v17_output_route", "")).strip() for row in csv_rows if row.get("v17_output_route")))
+    shadow_rows = [row for row in csv_rows if str(row.get("control_mode", "")).strip() == "shadow"]
+    shadow_non_takeover_true = sum(
+        1 for row in shadow_rows
+        if str(row.get("shadow_non_takeover", "")).strip().lower() in ("true", "1", "yes")
+    )
     out["rows"] = {"count": len(csv_rows), "modes": modes}
+    out["shadow_non_takeover"] = {
+        "shadow_rows": len(shadow_rows),
+        "true_rows": shadow_non_takeover_true,
+        "failures": max(0, len(shadow_rows) - shadow_non_takeover_true),
+        "pass": bool(shadow_rows) and shadow_non_takeover_true == len(shadow_rows),
+        "control_modes": control_modes,
+        "actual_actuator_sources": actuator_sources,
+        "v17_output_routes": output_routes,
+    }
     return out
 
 
@@ -186,8 +208,8 @@ def render_report(base_dir: str, runs: List[Dict[str, object]],
         "",
         "## Run Matrix",
         "",
-        "| run | category | backend | exit | rows | summary | non-takeover | inf p50/p95/p99 | loop p95 | lidar age p95 | safety timeouts |",
-        "|---|---|---:|---:|---:|---|---|---:|---:|---:|---:|",
+        "| run | category | backend | exit | rows | summary | non-takeover | queue max/drop | rss start/end/max | inf p50/p95/p99 | loop p95 | lidar age p95 | safety timeouts |",
+        "|---|---|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for run in runs:
         metrics = run.get("csv_metrics", {})
@@ -196,15 +218,35 @@ def render_report(base_dir: str, runs: List[Dict[str, object]],
         loop = metrics.get("loop_dt_ms", {})
         lidar = metrics.get("lidar_scan_age_ms", {})
         timeout = metrics.get("safety_inference_timeout_count", {}).get("max")
+        summary = run.get("summary", {}) or {}
+        non_takeover = summary.get("shadow_non_takeover_csv")
+        if non_takeover is None:
+            non_takeover = metrics.get("shadow_non_takeover", {}).get("pass")
+        if non_takeover is None:
+            non_takeover = run.get("shadow_non_takeover_log", False)
+        queue_max = summary.get("async_queue_depth_max")
+        if queue_max is None:
+            queue_max = metrics.get("async_queue_max_depth", {}).get("max")
+        dropped = summary.get("async_writer_dropped_records")
+        if dropped is None:
+            dropped = metrics.get("async_writer_dropped_records", {}).get("max")
+        rss_text = "{}/{}/{}".format(
+            summary.get("process_rss_mb_start"),
+            summary.get("process_rss_mb_end"),
+            summary.get("process_rss_mb_max"),
+        )
         lines.append(
-            "| {name} | {category} | {backend} | {exit_code} | {rows} | {summary_exists} | {shadow_non_takeover_log} | {p50}/{p95}/{p99} | {loop_p95} | {lidar_p95} | {timeout} |".format(
+            "| {name} | {category} | {backend} | {exit_code} | {rows} | {summary_exists} | {non_takeover} | {queue_max}/{dropped} | {rss_text} | {p50}/{p95}/{p99} | {loop_p95} | {lidar_p95} | {timeout} |".format(
                 name=run.get("name", ""),
                 category=run.get("category", ""),
                 backend=run.get("backend", ""),
                 exit_code=run.get("exit_code", ""),
                 rows="" if rows is None else rows,
                 summary_exists=run.get("summary_exists", False),
-                shadow_non_takeover_log=run.get("shadow_non_takeover_log", False),
+                non_takeover=non_takeover,
+                queue_max=queue_max,
+                dropped=dropped,
+                rss_text=rss_text,
                 p50=inf.get("p50"),
                 p95=inf.get("p95"),
                 p99=inf.get("p99"),

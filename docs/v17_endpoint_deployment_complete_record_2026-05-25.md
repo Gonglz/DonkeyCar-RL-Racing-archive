@@ -37,11 +37,13 @@ V17 端侧部署工程链路已经完成并冻结。当前结论只覆盖 Jetson
 - DataCollector CSV 和 LiDAR raw JSONL 异步写入。
 - Jetson telemetry 后台缓存。
 - Engine/metadata preflight fail-fast。
+- Engine/metadata mismatch negative tests。
 - Active 前 safety gate 参数和 runtime safety monitor。
 - `runtime_monitor.py --serial-port` 与 `cfg.RP2040_SERIAL_PORT` 统一。
 - Summary 和 aggregate report 生成工具。
 - 180s、10min、20min TensorRT shadow 复现实验。
 - 故障注入：engine missing、metadata missing、RP2040 missing、LiDAR disabled、LiDAR stale、inference timeout counter。
+- P1 证据补强：Async queue/RSS summary、CSV shadow non-takeover 显式字段、metadata mismatch fail-fast。
 
 ### 2.2 本轮不算作部署成果的内容
 
@@ -144,6 +146,7 @@ active 模式下，安全 gate 默认启用 `require_lidar`、`require_rp2040`�
 | `tools/compare_v17_torch_trt.py` | PyTorch actor vs TensorRT actor action diff |
 | `tools/aggregate_endpoint_validation.py` | 汇总多 run 矩阵，生成 aggregate JSON/Markdown |
 | `tools/publish_stale_lidar_scan.py` | 发布固定旧 timestamp 的 `/stale_scan`，验证 LiDAR stale gate |
+| `tools/check_v17_preflight_negative_cases.py` | engine/metadata mismatch negative tests |
 | `tools/run_v17_10min_post_gate.sh` | 10min TensorRT shadow post-gate 复现 runner |
 | `tools/run_v17_20min_final_shadow.sh` | 20min TensorRT final shadow 复现 runner |
 
@@ -155,6 +158,7 @@ active 模式下，安全 gate 默认启用 `require_lidar`、`require_rp2040`�
 | `docs/v17_endpoint_deployment_validation_result_2026-05-24.md` | 180s/10min/safety matrix 初轮结果 |
 | `docs/v17_p0_safety_gate_implementation_result_2026-05-24.md` | P0 safety gate 实现与复验 |
 | `docs/v17_endpoint_deployment_p0_hardening_result_2026-05-25.md` | P0 证据补强：replay diff、waterfall、runtime stale/drop、manifest |
+| `docs/v17_endpoint_deployment_p1_evidence_result_2026-05-25.md` | P1 证据补强：Async queue/RSS、CSV non-takeover、metadata mismatch |
 | `docs/v17_lidar_stale_pmic_validation_2026-05-24.md` | LiDAR stale 与 PMIC 100C 核查 |
 | `docs/v17_lidar_sectorization_async_datacollector_2026-05-18.md` | LiDAR/DataCollector/telemetry 优化复盘 |
 | `docs/v17_onnx_tensorrt_recap_2026-05-18.md` | ONNX/TensorRT 环境与早期性能复盘 |
@@ -850,6 +854,44 @@ Reproducibility manifest 已补到 final 20min run：
 
 判断：P0 hardening 后，端侧部署证据链从“能跑 shadow + 安全 gate 可观测”提升为“连续 LSTM 数值回归、延时归因、运行中故障计数、active mock 阻断、可复现 manifest”。
 
+### 17.11 P1 工程证据补强
+
+目录：
+
+`/home/jetson/mycar/monitor_logs/v17_p1_evidence_20260525_021003`
+
+180s TensorRT shadow：
+
+| 指标 | 数值 |
+|---|---:|
+| exit code | 0 |
+| duration | 179.110 s |
+| frames logged | 301 |
+| async queue max depth | 1 |
+| async writer backlog final | 0 |
+| async writer dropped records | 0 |
+| process RSS start/end/max MB | 2360.789 / 2312.117 / 2363.199 |
+| shadow non-takeover rows/failures | 301 / 0 |
+
+CSV 显式 non-takeover 字段：
+
+| 字段 | 数值 |
+|---|---|
+| `shadow_non_takeover_csv` | true |
+| `actual_actuator_sources` | `['user/manual']` |
+| `v17_output_routes` | `['shadow_only']` |
+
+Engine/metadata mismatch negative tests：
+
+| case | exit | entered vehicle loop | pass |
+|---|---:|---:|---:|
+| `metadata_lidar_dim_72` | 2 | false | true |
+| `metadata_lstm_hidden_128` | 2 | false | true |
+| `metadata_missing_lidar_meta` | 2 | false | true |
+| `metadata_bad_next_h_output` | 2 | false | true |
+
+判断：P1 补强后，DataCollector 异步化不再只靠 p99 低来说明效果，还能用 queue/backlog/dropped/RSS 证明没有后台堆积；shadow non-takeover 也从 runtime log 证据升级为 CSV 行级显式字段；preflight 从 missing 扩展到 mismatch negative tests。
+
 ## 18. 当前性能判断
 
 ### 18.1 TensorRT 的真实收益
@@ -1018,6 +1060,7 @@ python runtime_monitor.py drive \
 | `/home/jetson/mycar/monitor_logs/v17_lidar_stale_pmic_validation_20260524_2325` | LiDAR stale 和 PMIC 核查 |
 | `/home/jetson/mycar/monitor_logs/v17_final_20min_shadow_20260525_000752` | 最终 20min TensorRT shadow |
 | `/home/jetson/mycar/monitor_logs/v17_p0_hardening_20260525_011504` | P0 hardening：replay diff、waterfall、runtime stale/drop、active mock、manifest |
+| `/home/jetson/mycar/monitor_logs/v17_p1_evidence_20260525_021003` | P1 evidence：Async queue/RSS、CSV non-takeover、metadata mismatch |
 
 每个 run 应保留：
 
