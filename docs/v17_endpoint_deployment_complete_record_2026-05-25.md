@@ -154,6 +154,7 @@ active 模式下，安全 gate 默认启用 `require_lidar`、`require_rp2040`�
 | `docs/v17_endpoint_deployment_final_frozen_report_2026-05-25.md` | 最终冻结结论 |
 | `docs/v17_endpoint_deployment_validation_result_2026-05-24.md` | 180s/10min/safety matrix 初轮结果 |
 | `docs/v17_p0_safety_gate_implementation_result_2026-05-24.md` | P0 safety gate 实现与复验 |
+| `docs/v17_endpoint_deployment_p0_hardening_result_2026-05-25.md` | P0 证据补强：replay diff、waterfall、runtime stale/drop、manifest |
 | `docs/v17_lidar_stale_pmic_validation_2026-05-24.md` | LiDAR stale 与 PMIC 100C 核查 |
 | `docs/v17_lidar_sectorization_async_datacollector_2026-05-18.md` | LiDAR/DataCollector/telemetry 优化复盘 |
 | `docs/v17_onnx_tensorrt_recap_2026-05-18.md` | ONNX/TensorRT 环境与早期性能复盘 |
@@ -788,6 +789,67 @@ Part profile：
 - PMIC 仍固定 100C，但没有 runtime 热失控形态。
 - 20min run 出现 5 次 `[LiDAR ROS] AttributeError: 'NoneType' object has no attribute 'close'`，LiDAR CSV 数据持续有效，`lidar_missing_count=0`。记录为 ROS bridge shutdown/log noise，非端侧部署失败。
 
+### 17.10 P0 hardening 证据补强
+
+目录：
+
+`/home/jetson/mycar/monitor_logs/v17_p0_hardening_20260525_011504`
+
+Replay diff：
+
+| 指标 | 数值 |
+|---|---:|
+| samples | 1000 |
+| action max abs diff | 0.004552633 |
+| action p95 abs diff | 0.001630769 |
+| next_h p95 abs diff | 0.000851244 |
+| next_c p95 abs diff | 0.001974382 |
+| NaN/Inf count | 0 |
+| tolerance | 0.02 |
+| pass | true |
+
+Final 20min latency waterfall：
+
+| 模块 / 指标 | p50 ms | p95 ms | p99 ms | max ms |
+|---|---:|---:|---:|---:|
+| `pilot_preprocess_latency_ms` | 223.702 | 266.509 | 288.793 | 538.753 |
+| `actor_residual_ms` | 13.131 | 20.911 | 32.147 | 38.004 |
+| `pilot_inference_latency_ms` | 237.113 | 281.205 | 303.734 | 555.380 |
+| `loop_dt_ms` | 242.100 | 286.900 | 309.448 | 559.100 |
+| `lidar_scan_age_ms` | 274.600 | 351.220 | 454.944 | 606.800 |
+| `DataCollector` part | 0.040 | n/a | 9.870 | 23.090 |
+| `DeploymentSafetyGate` part | 0.060 | n/a | 0.150 | 2.280 |
+
+Runtime LiDAR fault injection：
+
+| run | exit | safety_blocked | stale count | missing count | 说明 |
+|---|---:|---:|---:|---:|---|
+| `runtime_lidar_freeze_shadow_35s_rerun` | 0 | false | 207 | 0 | freeze timestamp，shadow 只计数 |
+| `runtime_lidar_drop_shadow_35s_rerun2` | 0 | false | 235 | 0 | drop 后保留最后 scan，表现为 stale |
+
+Active safety mock：
+
+| case | safe output | vehicle.on | pass |
+|---|---|---:|---:|
+| LiDAR stale | angle=0, throttle=0 | false | true |
+| inference timeout | angle=0, throttle=0 | false | true |
+| RP2040 stale | angle=0, throttle=0 | false | true |
+
+Reproducibility manifest 已补到 final 20min run：
+
+`/home/jetson/mycar/monitor_logs/v17_final_20min_shadow_20260525_000752/trt_shadow_20min_final/repro_manifest.json`
+
+关键 hash：
+
+| artifact | SHA256 |
+|---|---|
+| model zip | `6dded04f69bcb827939e1a06b55b5f376faf4948162d96b3dcb28e0eb4b96a5d` |
+| ONNX | `d4680f9c433abb95987c62f256b1b4ba0eebfb9d3ef7b0f4fbe3f10447bbf9f3` |
+| TensorRT engine | `6176a98be9757f8ecd7d98a58322b0f50e20f6191a5618d8c5c3df610aae1de6` |
+| metadata | `a4e04786ecc65ea93b4a464c53698242b178d1866e9d565a045fdfc756b52b86` |
+
+判断：P0 hardening 后，端侧部署证据链从“能跑 shadow + 安全 gate 可观测”提升为“连续 LSTM 数值回归、延时归因、运行中故障计数、active mock 阻断、可复现 manifest”。
+
 ## 18. 当前性能判断
 
 ### 18.1 TensorRT 的真实收益
@@ -955,6 +1017,7 @@ python runtime_monitor.py drive \
 | `/home/jetson/mycar/monitor_logs/v17_p0_safety_gate_validation_20260524_2305` | P0 safety gate 验证 |
 | `/home/jetson/mycar/monitor_logs/v17_lidar_stale_pmic_validation_20260524_2325` | LiDAR stale 和 PMIC 核查 |
 | `/home/jetson/mycar/monitor_logs/v17_final_20min_shadow_20260525_000752` | 最终 20min TensorRT shadow |
+| `/home/jetson/mycar/monitor_logs/v17_p0_hardening_20260525_011504` | P0 hardening：replay diff、waterfall、runtime stale/drop、active mock、manifest |
 
 每个 run 应保留：
 

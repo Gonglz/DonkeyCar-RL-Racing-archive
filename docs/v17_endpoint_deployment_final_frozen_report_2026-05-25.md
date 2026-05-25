@@ -33,6 +33,7 @@ Jetson：`jetson@192.168.1.176`
 - telemetry cache。
 - shadow non-takeover：shadow 模式只记录 V17 输出，不接管 actuator。
 - 180s x3、10min x2、20min x1 TensorRT shadow 证据。
+- P0 hardening 证据：1000-sample continuous LSTM replay diff、final 20min latency waterfall、runtime LiDAR freeze/drop 注入、active safety mock、reproducibility manifest。
 
 ## 3. 最终 20min TensorRT Shadow 复现实验
 
@@ -157,6 +158,7 @@ tegrastats: PMIC@100C
 - 本报告：`docs/v17_endpoint_deployment_final_frozen_report_2026-05-25.md`
 - 端侧部署完整记录：`docs/v17_endpoint_deployment_complete_record_2026-05-25.md`
 - P0 safety gate 报告：`docs/v17_p0_safety_gate_implementation_result_2026-05-24.md`
+- P0 证据补强报告：`docs/v17_endpoint_deployment_p0_hardening_result_2026-05-25.md`
 - LiDAR stale / PMIC 核查报告：`docs/v17_lidar_stale_pmic_validation_2026-05-24.md`
 - 部署验证执行结果：`docs/v17_endpoint_deployment_validation_result_2026-05-24.md`
 - 视觉前端独立分析：`docs/v17_vision_frontend_separate_analysis_2026-05-24.md`

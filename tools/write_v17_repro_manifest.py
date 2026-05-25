@@ -50,16 +50,24 @@ def git_info(cwd: str, source_branch: Optional[str], source_commit: Optional[str
     branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
     commit = run_cmd(["git", "rev-parse", "HEAD"], cwd=cwd)
     status = run_cmd(["git", "status", "--short"], cwd=cwd)
+    branch_from_git = branch["ok"]
+    commit_from_git = commit["ok"]
     if not branch["ok"] and source_branch:
         branch = {"ok": True, "returncode": 0, "output": source_branch}
     if not commit["ok"] and source_commit:
         commit = {"ok": True, "returncode": 0, "output": source_commit}
+    if branch_from_git and commit_from_git:
+        source = "git"
+    elif source_branch or source_commit:
+        source = "env"
+    else:
+        source = "unknown"
     return {
         "branch": branch["output"] if branch["ok"] else "unknown",
         "commit": commit["output"] if commit["ok"] else "unknown",
         "dirty": bool(status["output"]) if status["ok"] else None,
         "status_short": status["output"] if status["ok"] else "unknown",
-        "source": "git" if branch["ok"] and commit["ok"] else "env_or_unknown",
+        "source": source,
     }
 
 

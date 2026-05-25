@@ -41,7 +41,7 @@ def main():
     args = parser.parse_args()
 
     rospy.init_node("publish_lidar_fault_sequence", anonymous=True)
-    pub = rospy.Publisher(args.topic, LaserScan, queue_size=1, latch=True)
+    pub = rospy.Publisher(args.topic, LaserScan, queue_size=1, latch=False)
     rate = rospy.Rate(args.rate_hz)
     started = time.time()
     deadline = started + args.duration_sec
