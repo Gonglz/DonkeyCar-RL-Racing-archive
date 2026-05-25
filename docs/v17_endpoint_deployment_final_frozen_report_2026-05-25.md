@@ -155,6 +155,7 @@ tegrastats: PMIC@100C
 端侧部署工程成果冻结为以下交付物：
 
 - 本报告：`docs/v17_endpoint_deployment_final_frozen_report_2026-05-25.md`
+- 端侧部署完整记录：`docs/v17_endpoint_deployment_complete_record_2026-05-25.md`
 - P0 safety gate 报告：`docs/v17_p0_safety_gate_implementation_result_2026-05-24.md`
 - LiDAR stale / PMIC 核查报告：`docs/v17_lidar_stale_pmic_validation_2026-05-24.md`
 - 部署验证执行结果：`docs/v17_endpoint_deployment_validation_result_2026-05-24.md`
