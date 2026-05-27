@@ -1,3 +1,5 @@
+> [!NOTE]
+> This repository is an archived snapshot of the original development history. The polished portfolio version now lives at https://github.com/Gonglz/DonkeyCar-RL-Racing.
 # mysim
 
 This directory is set up to work well as the repo root for simulator-side
